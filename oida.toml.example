@@ -1,0 +1,17 @@
+# OIDA assistant configuration. Copy to `oida.toml` and edit.
+# All fields are optional; the values below are the defaults.
+
+# Source parquet index (the source of truth).
+parquet_path = "oida-index-by-artifact.parquet"
+
+# Persistent DuckDB cache built from the parquet on first run.
+cache_path = "oida.duckdb"
+
+# Directory containing artifact files on disk, keyed by artifact_name.
+# Leave unset if you don't have the artifacts yet; artifact-text tools
+# will report `artifact_root_not_configured` and degrade gracefully.
+# artifact_root = "/path/to/artifacts"
+
+# Local Ollama endpoint and model used to drive tool calling.
+ollama_host = "http://localhost:11434"
+ollama_model = "qwen2.5-coder:latest"

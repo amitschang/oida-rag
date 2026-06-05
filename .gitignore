@@ -1,0 +1,12 @@
+/target
+
+# DuckDB cache built from the parquet (large, regenerable)
+/oida.duckdb
+/oida.duckdb.wal
+/oida-cache.tmp/
+
+# Source data (large; not tracked)
+/oida-index-by-artifact.parquet
+
+# Local user configuration
+/oida.toml
