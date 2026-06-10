@@ -110,3 +110,52 @@ pub struct RelatedEdge {
     /// BFS depth at which this edge was discovered (1 = direct).
     pub depth: u32,
 }
+
+/// The result of running a read-only SQL query against the cache.
+///
+/// On success, `columns` names the projected columns and `rows` holds one
+/// JSON-valued cell per column (lists/structs become JSON arrays/objects).
+/// On failure (invalid or rejected SQL, or a DuckDB execution error), `error`
+/// carries a human-readable message and `rows` is empty — letting the model
+/// read the error and correct its query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SqlQueryResult {
+    /// Column names in projection order.
+    pub columns: Vec<String>,
+    /// Result rows; each row has one JSON value per column.
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// Number of rows returned (`rows.len()`).
+    pub row_count: usize,
+    /// True if more rows existed than the requested row cap.
+    pub truncated: bool,
+    /// Error message when the query was rejected or failed; `None` on success.
+    pub error: Option<String>,
+}
+
+impl SqlQueryResult {
+    /// Build a failed result carrying only an error message.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            error: Some(message.into()),
+            ..Self::default()
+        }
+    }
+}
+
+/// One column of a table, as reported by `DESCRIBE`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ColumnInfo {
+    /// Column name.
+    pub name: String,
+    /// DuckDB type, e.g. `VARCHAR`, `BIGINT`, `VARCHAR[]`.
+    pub type_: String,
+}
+
+/// The schema of one cache table.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TableSchema {
+    /// Table name (`documents` or `artifacts`).
+    pub table: String,
+    /// Columns in definition order.
+    pub columns: Vec<ColumnInfo>,
+}

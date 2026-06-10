@@ -48,7 +48,15 @@ impl Index {
                 config.cache_path.display()
             );
         }
-        let conn = Connection::open(&config.cache_path)
+        // Open the cache hardened: read-only access, no external file/network
+        // access (blocks COPY TO, read_csv/read_parquet, httpfs, etc.), and a
+        // locked configuration so a query cannot re-enable those at runtime.
+        // This is the safety boundary that makes the arbitrary-SQL tool safe.
+        let db_config = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)?
+            .enable_external_access(false)?
+            .with("lock_configuration", "true")?;
+        let conn = Connection::open_with_flags(&config.cache_path, db_config)
             .with_context(|| format!("opening cache {}", config.cache_path.display()))?;
         let has_tables: i64 = conn.query_row(
             "SELECT count(*) FROM information_schema.tables \

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use oida_core::artifacts::{ArtifactText, read_artifact_text};
 use oida_core::model::{Artifact, Document, RelatedEdge, SearchHit};
-use oida_core::{Config, Index, SearchParams};
+use oida_core::{Config, Index, SearchParams, SqlQueryResult, TableSchema};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -24,6 +24,9 @@ const DEFAULT_TEXT_BYTES: u64 = 8 * 1024;
 const MAX_TEXT_BYTES: u64 = 64 * 1024;
 /// Maximum relationship-traversal depth a caller may request.
 const MAX_DEPTH: u32 = 3;
+/// Default and maximum rows returned by a `run_sql` query.
+const DEFAULT_SQL_ROWS: u32 = 200;
+const MAX_SQL_ROWS: u32 = 2000;
 
 /// The MCP server state: a shared index plus configuration.
 #[derive(Clone)]
@@ -115,6 +118,22 @@ pub struct GetRelatedRequest {
 pub struct RelatedResponse {
     pub count: usize,
     pub edges: Vec<RelatedEdge>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunSqlRequest {
+    /// A single read-only SQL statement (SELECT/WITH/DESCRIBE/EXPLAIN/SHOW/
+    /// SUMMARIZE). Writes, DDL, COPY, ATTACH, INSTALL/LOAD and multiple
+    /// statements are rejected.
+    pub sql: String,
+    /// Max rows to return (default 200, max 2000). Excess rows set `truncated`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SchemaResponse {
+    pub tables: Vec<TableSchema>,
 }
 
 /// Convert an `anyhow` error into an MCP internal error.
@@ -224,6 +243,42 @@ impl OidaServer {
             edges,
         }))
     }
+
+    /// Run an arbitrary read-only SQL query against the cache.
+    #[tool(
+        description = "Run a single read-only SQL query against the cache for ad-hoc \
+        counting, grouping, and filtering. Two tables: `documents` (one row per document) \
+        and `artifacts` (one row per artifact, joinable on `documents.id = artifacts.id`). \
+        Key `documents` columns: id, bn, title, industry, collection, genre, date_sent, \
+        date_received, topic, description, keywords, conversation (all VARCHAR), \
+        artifact_count (BIGINT), and list columns custodian, authors, recipients, cc, \
+        attachments, related, mentions, artifact_types (all VARCHAR[] -- use UNNEST to \
+        group by their elements). `artifacts` columns: id, name, media_type, md5 (VARCHAR), \
+        size (BIGINT). Only SELECT/WITH/DESCRIBE/EXPLAIN/SHOW/SUMMARIZE are allowed; writes, \
+        DDL, file/network access and multiple statements are rejected. Returns columns and \
+        JSON-valued rows (lists become arrays); on a bad query the `error` field explains \
+        why so you can fix and retry. Call describe_schema for the full column list."
+    )]
+    async fn run_sql(
+        &self,
+        Parameters(req): Parameters<RunSqlRequest>,
+    ) -> Result<Json<SqlQueryResult>, McpError> {
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_SQL_ROWS)
+            .clamp(1, MAX_SQL_ROWS) as usize;
+        Ok(Json(self.index.run_sql(&req.sql, limit)))
+    }
+
+    /// Report the columns and types of the cache tables.
+    #[tool(
+        description = "List the columns and DuckDB types of the `documents` and `artifacts` \
+        tables. Use this to write correct run_sql queries."
+    )]
+    async fn describe_schema(&self) -> Result<Json<SchemaResponse>, McpError> {
+        let tables = self.index.describe_schema().map_err(internal)?;
+        Ok(Json(SchemaResponse { tables }))
+    }
 }
 
 #[tool_handler]
@@ -234,7 +289,9 @@ impl ServerHandler for OidaServer {
              relationships (emails, attachments, mentions) plus on-disk artifacts (OCR text, \
              PDFs, images). Typical flow: search_documents to find candidates, get_document for \
              details and artifact lists, get_artifact_text for OCR content, get_related to \
-             explore the document network.",
+             explore the document network. For counts, grouping, or filters the fixed tools \
+             don't cover, use run_sql (read-only SQL over the documents/artifacts tables); call \
+             describe_schema first to learn the columns.",
         )
     }
 }

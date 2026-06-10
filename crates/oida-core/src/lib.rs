@@ -9,8 +9,10 @@ pub mod index;
 pub mod model;
 pub mod schema;
 pub mod search;
+pub mod sql;
 
 pub use config::Config;
 pub use index::Index;
 pub use model::{Artifact, Document, RelatedEdge, RelationKind, SearchHit};
+pub use model::{ColumnInfo, SqlQueryResult, TableSchema};
 pub use search::SearchParams;
