@@ -16,13 +16,16 @@ const MAX_ITERATIONS: usize = 8;
 const MAX_TOOL_RESULT_CHARS: usize = 6000;
 
 /// System prompt establishing the assistant's role and tool workflow.
-const SYSTEM_PROMPT: &str = "You are an assistant for exploring the OIDA (Opiods Industry
-Document Archive) archive of documents (OCR'd PDFs, emails, images) and the network of \
-connections between them. Use the available tools to ground every answer in the index: \
-search_documents to find documents, get_document for metadata and artifact lists, \
-get_artifact_text to read OCR text, and get_related to follow attachments, mentions, and \
-email threads. Prefer calling tools over guessing. Cite document ids and Bates numbers. \
-If a tool returns no results, say so plainly.";
+const SYSTEM_PROMPT: &str = "
+You are an assistant for exploring the OIDA (Opiods Industry Document Archive)
+archive of documents (OCR'd PDFs, emails, images) and the network of connections
+between them. Use the available tools to ground every answer in the index:
+search_documents to find documents, get_document for metadata and artifact
+lists, get_artifact_text to read OCR text, and get_related to follow
+attachments, mentions, and email threads. Prefer calling tools over guessing.
+Cite document ids and Bates numbers. If a tool returns no results, say so
+plainly.
+";
 
 /// Orchestrates conversation turns against Ollama with MCP-backed tools.
 pub struct Agent {
