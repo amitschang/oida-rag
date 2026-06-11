@@ -18,7 +18,7 @@
 //! dimension matches, and verify the model's current digest still equals the
 //! stored one — refusing to serve stale results if the model changed under us.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -637,22 +637,30 @@ async fn embed_job(embedder: &Embedder, rows: &[ChunkRow]) -> Result<(RecordBatc
     Ok((batch, d))
 }
 
+/// How far back the sliding-window ("recent") rate looks.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+
 /// Progress ticker: every interval, sample the shared counters and render a
-/// throughput line. On a TTY it rewrites a single line in place (250 ms); off a
-/// TTY (logs, pipes) it emits a periodic newline log (5 s) so captured output
-/// stays readable. Runs as its own task and stops when `stop` fires, printing a
-/// final summary.
+/// throughput line carrying two rates — a sliding-window "recent" rate (last
+/// [`RATE_WINDOW`]) and a cumulative average. A per-tick instantaneous rate is
+/// avoided because batches complete in bursts, so most ticks would read zero.
+///
+/// Throughput is measured from the first *embedded* chunk, so a resume's
+/// skip/scan phase (which produces no chunks) never enters the rate. On a TTY
+/// it rewrites one line in place; off a TTY (pod logs, pipes) it emits a
+/// periodic newline log. Stops when `stop` fires, printing a final summary.
 async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: oneshot::Receiver<()>) {
     let tty = std::io::stderr().is_terminal();
     let mut interval =
-        tokio::time::interval(Duration::from_millis(if tty { 250 } else { 5000 }));
+        tokio::time::interval(Duration::from_millis(if tty { 500 } else { 5000 }));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let start = Instant::now();
     let initial_chunks = progress.chunks.load(Ordering::Relaxed);
-    let mut last = start;
-    let mut last_chunks = initial_chunks;
-    let mut last_bytes = progress.text_bytes.load(Ordering::Relaxed);
+    // Set on the first tick that observes new chunks — the throughput clock.
+    let mut run_start: Option<Instant> = None;
+    // Recent (timestamp, chunks, bytes) samples within the window, for the
+    // sliding-window rate.
+    let mut samples: VecDeque<(Instant, u64, u64)> = VecDeque::new();
 
     loop {
         let stopping = tokio::select! {
@@ -665,20 +673,36 @@ async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: one
         let scanned = progress.scanned.load(Ordering::Relaxed);
         let missing = progress.missing.load(Ordering::Relaxed);
 
-        let dt = now.duration_since(last).as_secs_f64().max(1e-6);
-        let cps = (chunks - last_chunks) as f64 / dt;
-        let bps = (bytes - last_bytes) as f64 / dt;
-        // ~4 bytes per token is a rough English heuristic; labelled as an estimate.
-        let tps = bps / 4.0;
-        last = now;
-        last_chunks = chunks;
-        last_bytes = bytes;
+        if run_start.is_none() && chunks > initial_chunks {
+            run_start = Some(now);
+        }
+
+        // Sliding-window rate: compare now against the oldest sample still inside
+        // the window. This smooths over the bursts that make a per-tick delta read
+        // zero most of the time.
+        samples.push_back((now, chunks, bytes));
+        while matches!(samples.front(), Some(&(t, _, _)) if now.duration_since(t) > RATE_WINDOW) {
+            samples.pop_front();
+        }
+        let (recent_cps, recent_bps) = match samples.front() {
+            Some(&(t0, c0, b0)) if now > t0 => {
+                let dt = now.duration_since(t0).as_secs_f64();
+                ((chunks - c0) as f64 / dt, (bytes - b0) as f64 / dt)
+            }
+            _ => (0.0, 0.0),
+        };
+        // Cumulative average, measured from the first embedded chunk.
+        let avg_cps = run_start.map_or(0.0, |rs| {
+            (chunks - initial_chunks) as f64 / now.duration_since(rs).as_secs_f64().max(1e-6)
+        });
+        // ~4 bytes per token is a rough English heuristic; labelled an estimate.
+        let recent_tps = recent_bps / 4.0;
 
         let line = format!(
-            "{chunks} chunks | {cps:.0} chunks/s | {:.1} MB/s | ~{} tok/s | \
-             {scanned}/{total_artifacts} artifacts | {missing} missing",
-            bps / 1.0e6,
-            human_count(tps as u64),
+            "{chunks} chunks | 1m: {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tok/s | \
+             avg: {avg_cps:.0} ch/s | {scanned}/{total_artifacts} scanned | {missing} missing",
+            recent_bps / 1.0e6,
+            human_count(recent_tps as u64),
         );
         if tty {
             // \r returns to column 0; \x1b[K clears the rest of the line.
@@ -692,11 +716,11 @@ async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: one
             if tty {
                 eprintln!();
             }
-            let total_dt = now.duration_since(start).as_secs_f64().max(1e-6);
-            let avg = (chunks - initial_chunks) as f64 / total_dt;
+            let embedded = chunks - initial_chunks;
+            let secs = run_start.map_or(0.0, |rs| now.duration_since(rs).as_secs_f64());
             tracing::info!(
-                "embedding throughput: {} chunks this run in {total_dt:.0}s ({avg:.0} chunks/s avg)",
-                chunks - initial_chunks,
+                "embedding throughput: {embedded} chunks in {secs:.0}s ({:.0} chunks/s avg)",
+                embedded as f64 / secs.max(1e-6),
             );
             break;
         }
