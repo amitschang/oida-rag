@@ -64,6 +64,22 @@ fn is_text(name: &str, media_type: Option<&str>) -> bool {
     media_type == Some("text/plain") || name.to_lowercase().ends_with(".ocr")
 }
 
+/// Resolve an artifact's on-disk path under `root`.
+///
+/// The layout fans artifacts out under a directory per leading character, then
+/// a directory named for the artifact's stem (the name without its extension),
+/// then the file itself, e.g. `mskf0352.ocr` -> `m/s/k/f/mskf0352/mskf0352.ocr`.
+pub fn artifact_path(root: &Path, name: &str) -> PathBuf {
+    let stem = name.split('.').next().unwrap_or(name);
+    let mut path = root.to_path_buf();
+    for c in name.chars().take(4) {
+        path.push(c.to_string());
+    }
+    path.push(stem);
+    path.push(name);
+    path
+}
+
 /// Read up to `max_bytes` of an artifact's text starting at `offset`.
 pub fn read_artifact_text(
     config: &Config,
@@ -88,16 +104,7 @@ pub fn read_artifact_text(
         );
     }
 
-    // paths are under a hierarchy of the first four characters. Construct the
-    // path from the filename
-    let prefix_chars = name.chars().take(4).collect::<Vec<char>>();
-    let mut artifact_path = PathBuf::new();
-    for c in prefix_chars {
-        artifact_path.push(c.to_string());
-    }
-    artifact_path.push(name);
-
-    let path = root.join(artifact_path);
+    let path = artifact_path(root, name);
     if !path_is_file(&path) {
         return ArtifactText::status_only(
             name,
@@ -174,7 +181,13 @@ mod tests {
     fn loads_and_pages_text() {
         let dir = std::env::temp_dir().join(format!("oida-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("a").join("b").join("c").join("d").join("abcd_doc.ocr");
+        let path = dir
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d")
+            .join("abcd_doc")
+            .join("abcd_doc.ocr");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"hello world").unwrap();
 

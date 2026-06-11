@@ -19,6 +19,7 @@
 //! stored one — refusing to serve stale results if the model changed under us.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,7 +37,7 @@ use lancedb::rerankers::rrf::RRFReranker;
 use lancedb::table::{CompactionOptions, OptimizeAction};
 use lancedb::{Connection, Table};
 
-use crate::artifacts::{ArtifactTextStatus, read_artifact_text};
+use crate::artifacts::{ArtifactTextStatus, artifact_path, read_artifact_text};
 use crate::config::Config;
 use crate::embed::Embedder;
 use crate::index::Index;
@@ -279,8 +280,24 @@ pub async fn build(
         }
         // u64::MAX / 2 reads the whole file without risking an offset overflow.
         let loaded = read_artifact_text(config, name, media_type.as_deref(), 0, u64::MAX / 2);
-        if loaded.status != ArtifactTextStatus::TextLoaded {
-            continue;
+        match loaded.status {
+            ArtifactTextStatus::TextLoaded => {}
+            // A referenced file that is not on disk means the artifact_root is
+            // wrong or the data is incomplete — either way the index would be
+            // silently partial, so fail loudly instead of skipping.
+            ArtifactTextStatus::ArtifactFileMissing => {
+                let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
+                bail!(
+                    "artifact '{name}' (doc {doc_id}) is referenced but not found at {}; \
+                     check artifact_root ({})",
+                    artifact_path(root, name).display(),
+                    root.display()
+                );
+            }
+            // Not a text type we read in v1 (the listing should already exclude
+            // these, but skip defensively rather than fail the whole build).
+            ArtifactTextStatus::UnsupportedArtifactType
+            | ArtifactTextStatus::ArtifactRootNotConfigured => continue,
         }
         let Some(body) = loaded.text else { continue };
         for (idx, chunk) in chunk_text(&body, config.chunk_bytes, config.chunk_overlap)
