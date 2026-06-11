@@ -74,6 +74,10 @@ struct Args {
     #[arg(long, env = "OIDA_EMBED_CONCURRENCY")]
     embed_concurrency: Option<usize>,
 
+    /// Text chunks per embed request during a full-text build (overrides config).
+    #[arg(long, env = "OIDA_EMBED_BATCH")]
+    embed_batch: Option<usize>,
+
     /// Context window (tokens) sent as `num_ctx` on embed requests; 0 omits it
     /// and uses the model/server default (overrides config).
     #[arg(long, env = "OIDA_EMBED_NUM_CTX")]
@@ -155,6 +159,9 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     }
     if let Some(v) = args.embed_concurrency {
         config.embed_concurrency = v;
+    }
+    if let Some(v) = args.embed_batch {
+        config.embed_batch = v;
     }
     if let Some(v) = args.embed_num_ctx {
         // 0 is the escape hatch for "omit num_ctx and defer to the model default".

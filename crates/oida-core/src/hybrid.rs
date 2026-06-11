@@ -19,9 +19,11 @@
 //! stored one — refusing to serve stale results if the model changed under us.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -29,7 +31,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::FtsIndexBuilder;
@@ -48,11 +50,24 @@ use crate::ingest::connect;
 const CHUNKS_TABLE: &str = "chunks";
 /// Name of the single-row table holding index metadata.
 const META_TABLE: &str = "_meta";
-/// Number of chunks embedded per Ollama request during a build.
-const EMBED_BATCH: usize = 64;
 /// Below this row count a vector (ANN) index is skipped; flat search is exact
 /// and fast enough, and IVF/PQ training needs a reasonable number of rows.
 const MIN_VECTOR_INDEX_ROWS: usize = 256;
+
+/// Live build counters, updated lock-free by the pipeline stages and sampled by
+/// the progress ticker. Decoupling counting (hot path) from rendering (timer)
+/// keeps display cadence independent of work cadence.
+#[derive(Default)]
+struct Progress {
+    /// Artifacts the reader has walked (whether read, skipped, or missing).
+    scanned: AtomicU64,
+    /// Chunks embedded so far (includes any seeded from a resume).
+    chunks: AtomicU64,
+    /// Bytes of chunk text embedded so far, for a throughput/token estimate.
+    text_bytes: AtomicU64,
+    /// Referenced artifact files that were not on disk.
+    missing: AtomicU64,
+}
 
 /// A single fused chunk hit, before hydration into a full document.
 #[derive(Debug, Clone)]
@@ -318,21 +333,38 @@ pub async fn build(
     // in document order and keeps durable writes aligned to document boundaries
     // — the invariant `resume` depends on (a `doc_id` in the table is complete).
     let concurrency = config.embed_concurrency.max(1);
+    let embed_batch = config.embed_batch.max(1);
     let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<ChunkRow>>(concurrency * 2);
     let (out_tx, out_rx) = mpsc::channel::<RecordBatch>(concurrency * 2);
+
+    // Shared live counters and the timer-driven ticker that renders them. The
+    // chunk counter is seeded with the resumed total so the displayed figure is
+    // cumulative.
+    let progress = Arc::new(Progress::default());
+    progress.chunks.store(prior_chunks, Ordering::Relaxed);
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let ticker = {
+        let progress = progress.clone();
+        tokio::spawn(run_ticker(progress, total_artifacts as u64, stop_rx))
+    };
 
     // Reader: synchronous file I/O + chunking, on a blocking thread so it never
     // stalls the async embed/write stages.
     let reader = {
         let cfg = config.clone();
-        tokio::task::spawn_blocking(move || run_reader(&cfg, artifacts, done, jobs_tx))
+        let progress = progress.clone();
+        tokio::task::spawn_blocking(move || {
+            run_reader(&cfg, artifacts, done, embed_batch, &progress, jobs_tx)
+        })
     };
 
     // Embedder: keep `concurrency` embed requests in flight, results in order.
     let embed_stage = {
         let embedder = embedder.clone();
+        let progress = progress.clone();
         tokio::spawn(async move {
-            run_embedder(embedder, jobs_rx, out_tx, seed_dim, prior_chunks, concurrency).await
+            run_embedder(embedder, jobs_rx, out_tx, seed_dim, prior_chunks, concurrency, &progress)
+                .await
         })
     };
 
@@ -348,6 +380,9 @@ pub async fn build(
     let ReaderStats { docs: new_docs, missing } =
         reader.await.context("reader task panicked")?;
     let (dim, chunk_count) = embed_stage.await.context("embedder task panicked")??;
+    // Stop the ticker and let it print its final summary line.
+    let _ = stop_tx.send(());
+    let _ = ticker.await;
     let doc_count = prior_docs + new_docs;
 
     if missing > 0 {
@@ -456,17 +491,17 @@ fn run_reader(
     config: &Config,
     artifacts: Vec<(String, String, Option<String>)>,
     done: HashSet<String>,
+    embed_batch: usize,
+    progress: &Progress,
     jobs_tx: mpsc::Sender<Vec<ChunkRow>>,
 ) -> ReaderStats {
-    let total = artifacts.len();
     let mut pending: Vec<ChunkRow> = Vec::new();
     let mut docs = 0u64;
     let mut missing = 0u64;
     let mut last_doc: Option<&str> = None;
-    // Throttle progress logging to once per this many artifacts scanned.
-    const PROGRESS_EVERY: usize = 500;
 
-    for (scanned, (doc_id, name, media_type)) in artifacts.iter().enumerate() {
+    for (doc_id, name, media_type) in artifacts.iter() {
+        progress.scanned.fetch_add(1, Ordering::Relaxed);
         // Skip documents already fully indexed by a prior, interrupted build.
         if done.contains(doc_id) {
             continue;
@@ -474,11 +509,6 @@ fn run_reader(
         if last_doc != Some(doc_id.as_str()) {
             docs += 1;
             last_doc = Some(doc_id);
-        }
-        if scanned > 0 && scanned % PROGRESS_EVERY == 0 {
-            tracing::info!(
-                "read progress: {scanned}/{total} artifacts scanned, {missing} files missing so far"
-            );
         }
         // u64::MAX / 2 reads the whole file without risking an offset overflow.
         let loaded = read_artifact_text(config, name, media_type.as_deref(), 0, u64::MAX / 2);
@@ -499,6 +529,7 @@ fn run_reader(
                     );
                 }
                 missing += 1;
+                progress.missing.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             // Not a text type we read in v1 (the listing should already exclude
@@ -518,14 +549,14 @@ fn run_reader(
                 text: chunk,
             });
         }
-        // Hand off in `EMBED_BATCH`-sized jobs. Drain whole batches in a loop
+        // Hand off in `embed_batch`-sized jobs. Drain whole batches in a loop
         // rather than shipping the leftover `pending` in one shot: a single
         // large artifact can chunk into thousands of rows, and sending them as
         // one embed request crashes the Ollama runner. Jobs may span documents —
         // the writer realigns to document boundaries — so small documents still
         // pack into full embed requests for GPU efficiency.
-        while pending.len() >= EMBED_BATCH {
-            let job: Vec<ChunkRow> = pending.drain(..EMBED_BATCH).collect();
+        while pending.len() >= embed_batch {
+            let job: Vec<ChunkRow> = pending.drain(..embed_batch).collect();
             if jobs_tx.blocking_send(job).is_err() {
                 // Embed stage went away (it errored); stop reading.
                 return ReaderStats { docs, missing };
@@ -550,6 +581,7 @@ async fn run_embedder(
     seed_dim: Option<usize>,
     prior_chunks: u64,
     concurrency: usize,
+    progress: &Progress,
 ) -> Result<(Option<usize>, u64)> {
     // Adapt the channel into a Stream so `buffered` can drive N embeds at once.
     let jobs = futures::stream::unfold(jobs_rx, |mut rx| async move {
@@ -560,8 +592,9 @@ async fn run_embedder(
             let embedder = embedder.clone();
             async move {
                 let n = rows.len();
+                let bytes: u64 = rows.iter().map(|r| r.text.len() as u64).sum();
                 let (batch, d) = embed_job(&embedder, &rows).await?;
-                Ok::<(RecordBatch, usize, usize), anyhow::Error>((batch, d, n))
+                Ok::<(RecordBatch, usize, usize, u64), anyhow::Error>((batch, d, n, bytes))
             }
         })
         .buffered(concurrency);
@@ -570,10 +603,8 @@ async fn run_embedder(
 
     let mut dim = seed_dim;
     let mut chunk_count = prior_chunks;
-    const PROGRESS_CHUNKS: u64 = 5000;
-    let mut next_log = prior_chunks + PROGRESS_CHUNKS;
     while let Some(item) = embedded.next().await {
-        let (batch, d, n) = item?;
+        let (batch, d, n, bytes) = item?;
         match dim {
             Some(existing) if existing != d => {
                 bail!("embedding dimension changed from {existing} to {d} mid-build")
@@ -582,10 +613,9 @@ async fn run_embedder(
             _ => {}
         }
         chunk_count += n as u64;
-        if chunk_count >= next_log {
-            tracing::info!("embed progress: {chunk_count} chunks embedded");
-            next_log = chunk_count + PROGRESS_CHUNKS;
-        }
+        // Publish for the ticker (rendering happens on its own timer).
+        progress.chunks.fetch_add(n as u64, Ordering::Relaxed);
+        progress.text_bytes.fetch_add(bytes, Ordering::Relaxed);
         if out_tx.send(batch).await.is_err() {
             // Writer stopped (it errored); its error is the real failure and the
             // caller surfaces it, so just stop pulling.
@@ -605,6 +635,83 @@ async fn embed_job(embedder: &Embedder, rows: &[ChunkRow]) -> Result<(RecordBatc
     let d = vectors[0].len();
     let batch = build_record_batch(rows, &vectors, d as i32)?;
     Ok((batch, d))
+}
+
+/// Progress ticker: every interval, sample the shared counters and render a
+/// throughput line. On a TTY it rewrites a single line in place (250 ms); off a
+/// TTY (logs, pipes) it emits a periodic newline log (5 s) so captured output
+/// stays readable. Runs as its own task and stops when `stop` fires, printing a
+/// final summary.
+async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: oneshot::Receiver<()>) {
+    let tty = std::io::stderr().is_terminal();
+    let mut interval =
+        tokio::time::interval(Duration::from_millis(if tty { 250 } else { 5000 }));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let start = Instant::now();
+    let initial_chunks = progress.chunks.load(Ordering::Relaxed);
+    let mut last = start;
+    let mut last_chunks = initial_chunks;
+    let mut last_bytes = progress.text_bytes.load(Ordering::Relaxed);
+
+    loop {
+        let stopping = tokio::select! {
+            _ = interval.tick() => false,
+            _ = &mut stop => true,
+        };
+        let now = Instant::now();
+        let chunks = progress.chunks.load(Ordering::Relaxed);
+        let bytes = progress.text_bytes.load(Ordering::Relaxed);
+        let scanned = progress.scanned.load(Ordering::Relaxed);
+        let missing = progress.missing.load(Ordering::Relaxed);
+
+        let dt = now.duration_since(last).as_secs_f64().max(1e-6);
+        let cps = (chunks - last_chunks) as f64 / dt;
+        let bps = (bytes - last_bytes) as f64 / dt;
+        // ~4 bytes per token is a rough English heuristic; labelled as an estimate.
+        let tps = bps / 4.0;
+        last = now;
+        last_chunks = chunks;
+        last_bytes = bytes;
+
+        let line = format!(
+            "{chunks} chunks | {cps:.0} chunks/s | {:.1} MB/s | ~{} tok/s | \
+             {scanned}/{total_artifacts} artifacts | {missing} missing",
+            bps / 1.0e6,
+            human_count(tps as u64),
+        );
+        if tty {
+            // \r returns to column 0; \x1b[K clears the rest of the line.
+            eprint!("\r\x1b[K{line}");
+            let _ = std::io::stderr().flush();
+        } else {
+            tracing::info!("{line}");
+        }
+
+        if stopping {
+            if tty {
+                eprintln!();
+            }
+            let total_dt = now.duration_since(start).as_secs_f64().max(1e-6);
+            let avg = (chunks - initial_chunks) as f64 / total_dt;
+            tracing::info!(
+                "embedding throughput: {} chunks this run in {total_dt:.0}s ({avg:.0} chunks/s avg)",
+                chunks - initial_chunks,
+            );
+            break;
+        }
+    }
+}
+
+/// Format a count compactly with a K/M suffix (for the high-magnitude tok/s).
+fn human_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1.0e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1.0e3)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Writer stage: accumulate embedded batches (already in document order) and
