@@ -23,8 +23,10 @@ pub const DEFAULT_CHUNK_OVERLAP: usize = 256;
 /// hybrid index. Embedded chunk batches accumulate until they reach this size,
 /// then flush to LanceDB in a single `Table::add`. This decouples the (small)
 /// Ollama embed batch from the (large) Lance fragment, keeping fragment churn
-/// low. ~1 GiB yields healthy Lance fragments while bounding peak memory.
-pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 1 << 30;
+/// low. Each flush is also a durable checkpoint that `--resume` can restart
+/// from, so this is kept modest (128 MiB) to bound how much embedding work a
+/// crash can lose while still yielding healthy Lance fragments.
+pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 128 << 20;
 /// Whether to compact the chunks table after a hybrid-index build by default.
 pub const DEFAULT_COMPACT_ON_BUILD: bool = true;
 /// Default in-memory buffer target, in bytes, before the metadata ingest flushes

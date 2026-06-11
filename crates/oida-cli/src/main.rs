@@ -97,6 +97,10 @@ enum Command {
         /// Replace an existing index instead of failing.
         #[arg(long)]
         force: bool,
+        /// Continue an interrupted full-text build, skipping documents that are
+        /// already indexed. Implies `--full-text`; cannot combine with `--force`.
+        #[arg(long, conflicts_with = "force")]
+        resume: bool,
     },
     /// Show statistics about the ingested index.
     Stats,
@@ -177,8 +181,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Dispatch management subcommands before touching the MCP server.
     match &args.command {
-        Some(Command::Ingest { full_text, force }) => {
-            return run_ingest(&config, *full_text, *force).await;
+        Some(Command::Ingest { full_text, force, resume }) => {
+            return run_ingest(&config, *full_text, *force, *resume).await;
         }
         Some(Command::Stats) => return run_stats(&config).await,
         None => {}
@@ -216,7 +220,30 @@ async fn main() -> anyhow::Result<()> {
 
 /// Run the `ingest` subcommand: load metadata, then optionally the full-text
 /// index, reporting progress to stderr.
-async fn run_ingest(config: &Config, full_text: bool, force: bool) -> anyhow::Result<()> {
+async fn run_ingest(
+    config: &Config,
+    full_text: bool,
+    force: bool,
+    resume: bool,
+) -> anyhow::Result<()> {
+    // Resuming continues an interrupted full-text build only; the metadata
+    // tables it relies on are already present, so skip re-ingesting them (which
+    // would otherwise refuse to run or wipe the partial chunks table).
+    if resume {
+        let index = Index::open(config)
+            .await
+            .context("opening index to resume (run a metadata ingest first)")?;
+        let model = &config.embed_model;
+        let embedder = Embedder::new(&config.ollama_host, model.to_string())?;
+        eprintln!("Resuming hybrid text index build with embed model '{model}'…");
+        let hstats = hybrid::build(config, &index, &embedder, false, true).await?;
+        eprintln!(
+            "Indexed {} chunks across {} documents (dim {}).",
+            hstats.chunks, hstats.documents, hstats.dim
+        );
+        return Ok(());
+    }
+
     eprintln!("Ingesting metadata from {}…", config.parquet_path.display());
     let stats = Index::ingest_metadata(config, force)
         .await
@@ -231,7 +258,7 @@ async fn run_ingest(config: &Config, full_text: bool, force: bool) -> anyhow::Re
         let model = &config.embed_model;
         let embedder = Embedder::new(&config.ollama_host, model.to_string())?;
         eprintln!("Building hybrid text index with embed model '{model}'…");
-        let hstats = hybrid::build(config, &index, &embedder, force).await?;
+        let hstats = hybrid::build(config, &index, &embedder, force, false).await?;
         eprintln!(
             "Indexed {} chunks across {} documents (dim {}).",
             hstats.chunks, hstats.documents, hstats.dim

@@ -18,7 +18,7 @@
 //! dimension matches, and verify the model's current digest still equals the
 //! stored one — refusing to serve stale results if the model changed under us.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -217,22 +217,41 @@ impl HybridIndex {
 /// embeds the chunks with `embedder`, and writes them to LanceDB along with a
 /// `_meta` row pinning the embed model and its digest. Pass `force` to replace
 /// an existing index.
+///
+/// Pass `resume` to continue an interrupted build: the existing `chunks` table
+/// is kept, every `doc_id` already present is skipped, and embedding picks up
+/// from the first un-indexed document. This is safe because durable writes are
+/// aligned to document boundaries (see the scan loop), so a `doc_id` in the
+/// table is always complete — never a partial document. `resume` and `force`
+/// are mutually exclusive.
 pub async fn build(
     config: &Config,
     index: &Index,
     embedder: &Embedder,
     force: bool,
+    resume: bool,
 ) -> Result<IndexStats> {
     if config.artifact_root.is_none() {
         bail!("artifact_root is not configured; the hybrid index needs the text files on disk");
     }
 
+    if force && resume {
+        bail!("force and resume are mutually exclusive");
+    }
+
     let db = connect(config).await?;
     let existing = db.table_names().execute().await.context("listing tables")?;
     let have_index = existing.iter().any(|n| n == CHUNKS_TABLE);
-    if have_index && !force {
+    if resume && !have_index {
         bail!(
-            "hybrid index already exists at {}; pass force to rebuild",
+            "nothing to resume: no '{CHUNKS_TABLE}' table at {}; \
+             run a build first (without resume)",
+            config.lance_path.display()
+        );
+    }
+    if have_index && !force && !resume {
+        bail!(
+            "hybrid index already exists at {}; pass force to rebuild or resume to continue",
             config.lance_path.display()
         );
     }
@@ -266,11 +285,57 @@ pub async fn build(
     // Referenced artifacts whose file was not on disk (skipped, not fatal).
     let mut missing: u64 = 0;
     let mut last_doc: Option<String> = None;
+    // Documents already present from a prior (interrupted) build; skipped here.
+    let mut done: HashSet<String> = HashSet::new();
+
+    if resume {
+        let t = db
+            .open_table(CHUNKS_TABLE)
+            .execute()
+            .await
+            .context("opening chunks table to resume")?;
+        // Seed the dimension from the stored vectors so `embed_rows` will catch
+        // a model swap (a differently-sized embedding) on the first new batch.
+        dim = Some(vector_dim(&t).await?);
+        done = existing_doc_ids(&t).await?;
+        let prior_chunks = t.count_rows(None).await.context("counting existing chunks")?;
+        chunk_count = prior_chunks as u64;
+        doc_count = done.len() as u64;
+        // The interrupted build never wrote `_meta`; drop any stale one so the
+        // finalize step can recreate it cleanly.
+        if existing.iter().any(|n| n == META_TABLE) {
+            db.drop_table(META_TABLE, &[]).await.context("dropping stale _meta table")?;
+        }
+        table = Some(t);
+        tracing::info!(
+            "resuming: {} documents ({prior_chunks} chunks) already indexed; skipping them",
+            done.len()
+        );
+    }
+
     // Throttle progress logging to once per this many artifacts scanned.
     const PROGRESS_EVERY: usize = 500;
 
     for (scanned, (doc_id, name, media_type)) in artifacts.iter().enumerate() {
+        // Skip documents already fully indexed by a prior, interrupted build.
+        if done.contains(doc_id) {
+            continue;
+        }
+
+        // Document boundary. Durable writes happen here and *only* here: a Lance
+        // fragment is flushed only when crossing into a new document, so it
+        // always ends on a complete document and never splits one mid-way. That
+        // invariant is what makes `resume` correct — a `doc_id` present in the
+        // table is guaranteed to have all of its chunks. To take the checkpoint
+        // we must first embed the just-finished document's tail (`pending`) so
+        // it lands in the buffer before the write.
         if last_doc.as_deref() != Some(doc_id.as_str()) {
+            if buffer_bytes >= config.write_buffer_bytes {
+                flush_pending(&mut pending, &mut dim, embedder, &mut buffer, &mut buffer_bytes, &mut chunk_count)
+                    .await?;
+                write_buffer(&db, &mut table, &mut buffer).await?;
+                buffer_bytes = 0;
+            }
             doc_count += 1;
             last_doc = Some(doc_id.clone());
         }
@@ -318,24 +383,17 @@ pub async fn build(
                 text: chunk,
             });
         }
+        // Embed in `EMBED_BATCH`-sized requests as chunks accumulate. This only
+        // grows the in-memory `buffer`; it never writes to LanceDB (that is the
+        // document-boundary checkpoint above), so `pending` may span documents
+        // for efficient batching without ever splitting a written fragment.
         if pending.len() >= EMBED_BATCH {
-            chunk_count += pending.len() as u64;
-            let batch = embed_rows(&mut dim, embedder, &pending).await?;
-            pending.clear();
-            buffer_bytes += batch.get_array_memory_size();
-            buffer.push(batch);
-            if buffer_bytes >= config.write_buffer_bytes {
-                write_buffer(&db, &mut table, &mut buffer).await?;
-                buffer_bytes = 0;
-            }
+            flush_pending(&mut pending, &mut dim, embedder, &mut buffer, &mut buffer_bytes, &mut chunk_count)
+                .await?;
         }
     }
-    if !pending.is_empty() {
-        chunk_count += pending.len() as u64;
-        let batch = embed_rows(&mut dim, embedder, &pending).await?;
-        pending.clear();
-        buffer.push(batch);
-    }
+    // Final document: embed its tail and persist whatever remains.
+    flush_pending(&mut pending, &mut dim, embedder, &mut buffer, &mut buffer_bytes, &mut chunk_count).await?;
     if !buffer.is_empty() {
         write_buffer(&db, &mut table, &mut buffer).await?;
     }
@@ -450,6 +508,64 @@ async fn embed_rows(
         _ => {}
     }
     build_record_batch(rows, &vectors, d as i32)
+}
+
+/// Embed the `pending` chunk rows (if any) and append the resulting batch to
+/// the in-memory `buffer`, updating the byte and chunk tallies and clearing
+/// `pending`. This never touches LanceDB — it only grows the buffer that the
+/// caller later flushes at a document boundary.
+async fn flush_pending(
+    pending: &mut Vec<ChunkRow>,
+    dim: &mut Option<usize>,
+    embedder: &Embedder,
+    buffer: &mut Vec<RecordBatch>,
+    buffer_bytes: &mut usize,
+    chunk_count: &mut u64,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    *chunk_count += pending.len() as u64;
+    let batch = embed_rows(dim, embedder, pending).await?;
+    pending.clear();
+    *buffer_bytes += batch.get_array_memory_size();
+    buffer.push(batch);
+    Ok(())
+}
+
+/// Read the embedding dimension from an existing chunks table's schema, used to
+/// seed `dim` when resuming so a mid-build model swap is still caught.
+async fn vector_dim(table: &Table) -> Result<usize> {
+    let schema = table.schema().await.context("reading chunks schema")?;
+    let field = schema
+        .field_with_name("vector")
+        .context("chunks table has no vector column")?;
+    match field.data_type() {
+        DataType::FixedSizeList(_, n) => Ok(*n as usize),
+        other => bail!("chunks vector column has unexpected type {other:?}"),
+    }
+}
+
+/// Collect the set of `doc_id`s already present in the chunks table so a resumed
+/// build can skip them. Reads only the `doc_id` column.
+async fn existing_doc_ids(table: &Table) -> Result<HashSet<String>> {
+    let batches: Vec<RecordBatch> = table
+        .query()
+        .select(Select::columns(&["doc_id"]))
+        .execute()
+        .await
+        .context("scanning existing doc_ids")?
+        .try_collect()
+        .await
+        .context("collecting existing doc_ids")?;
+    let mut out = HashSet::new();
+    for batch in &batches {
+        let ids = str_col(batch, "doc_id")?;
+        for row in 0..batch.num_rows() {
+            out.insert(ids.value(row).to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// Flush the buffered batches to LanceDB in a single `Table::add` (creating the

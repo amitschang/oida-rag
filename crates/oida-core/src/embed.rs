@@ -52,9 +52,8 @@ impl Embedder {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("sending embed request to {url}"))?
-            .error_for_status()
-            .context("ollama returned an error status for /api/embed")?;
+            .with_context(|| format!("sending embed request to {url}"))?;
+        let response = check_status(response, "/api/embed").await?;
         let parsed: EmbedResponse = response
             .json()
             .await
@@ -93,9 +92,8 @@ impl Embedder {
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("sending tags request to {url}"))?
-            .error_for_status()
-            .context("ollama returned an error status for /api/tags")?;
+            .with_context(|| format!("sending tags request to {url}"))?;
+        let response = check_status(response, "/api/tags").await?;
         let parsed: TagsResponse = response
             .json()
             .await
@@ -117,6 +115,42 @@ impl Embedder {
             None => bail!("model {wanted} is not installed (not listed by /api/tags)"),
         }
     }
+}
+
+/// Return the response unchanged on a 2xx status, otherwise fail with an error
+/// that includes Ollama's response body.
+///
+/// Ollama reports failures as a JSON `{"error": "..."}` payload alongside the
+/// HTTP status; `reqwest::Response::error_for_status` discards that body, so a
+/// 400 would otherwise surface as a bare status code with no hint as to which
+/// input it rejected or why (e.g. an input that exceeds the model's context
+/// length). We read the body and fold the `error` string into the message.
+async fn check_status(response: reqwest::Response, endpoint: &str) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<ErrorBody>(&body)
+        .ok()
+        .and_then(|e| e.error)
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "no response body".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        });
+    bail!("ollama returned {status} for {endpoint}: {detail}");
+}
+
+/// The `{"error": "..."}` payload Ollama returns alongside an error status.
+#[derive(Debug, Deserialize)]
+struct ErrorBody {
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// Request body for `POST /api/embed`.
