@@ -222,8 +222,11 @@ impl HybridIndex {
 /// is kept, every `doc_id` already present is skipped, and embedding picks up
 /// from the first un-indexed document. This is safe because durable writes are
 /// aligned to document boundaries (see the scan loop), so a `doc_id` in the
-/// table is always complete — never a partial document. `resume` and `force`
-/// are mutually exclusive.
+/// table is always complete — never a partial document. If no `chunks` table
+/// exists yet (e.g. a crash before the first checkpoint), `resume` simply
+/// builds the index from scratch; either way it never re-ingests the
+/// `documents`/`artifacts` metadata. `resume` and `force` are mutually
+/// exclusive.
 pub async fn build(
     config: &Config,
     index: &Index,
@@ -242,13 +245,6 @@ pub async fn build(
     let db = connect(config).await?;
     let existing = db.table_names().execute().await.context("listing tables")?;
     let have_index = existing.iter().any(|n| n == CHUNKS_TABLE);
-    if resume && !have_index {
-        bail!(
-            "nothing to resume: no '{CHUNKS_TABLE}' table at {}; \
-             run a build first (without resume)",
-            config.lance_path.display()
-        );
-    }
     if have_index && !force && !resume {
         bail!(
             "hybrid index already exists at {}; pass force to rebuild or resume to continue",
@@ -289,28 +285,36 @@ pub async fn build(
     let mut done: HashSet<String> = HashSet::new();
 
     if resume {
-        let t = db
-            .open_table(CHUNKS_TABLE)
-            .execute()
-            .await
-            .context("opening chunks table to resume")?;
-        // Seed the dimension from the stored vectors so `embed_rows` will catch
-        // a model swap (a differently-sized embedding) on the first new batch.
-        dim = Some(vector_dim(&t).await?);
-        done = existing_doc_ids(&t).await?;
-        let prior_chunks = t.count_rows(None).await.context("counting existing chunks")?;
-        chunk_count = prior_chunks as u64;
-        doc_count = done.len() as u64;
         // The interrupted build never wrote `_meta`; drop any stale one so the
         // finalize step can recreate it cleanly.
         if existing.iter().any(|n| n == META_TABLE) {
             db.drop_table(META_TABLE, &[]).await.context("dropping stale _meta table")?;
         }
-        table = Some(t);
-        tracing::info!(
-            "resuming: {} documents ({prior_chunks} chunks) already indexed; skipping them",
-            done.len()
-        );
+        if have_index {
+            let t = db
+                .open_table(CHUNKS_TABLE)
+                .execute()
+                .await
+                .context("opening chunks table to resume")?;
+            // Seed the dimension from the stored vectors so `embed_rows` will
+            // catch a model swap (a differently-sized embedding) on the first
+            // new batch.
+            dim = Some(vector_dim(&t).await?);
+            done = existing_doc_ids(&t).await?;
+            let prior_chunks = t.count_rows(None).await.context("counting existing chunks")?;
+            chunk_count = prior_chunks as u64;
+            doc_count = done.len() as u64;
+            table = Some(t);
+            tracing::info!(
+                "resuming: {} documents ({prior_chunks} chunks) already indexed; skipping them",
+                done.len()
+            );
+        } else {
+            // Nothing embedded yet (e.g. a crash before the first checkpoint):
+            // resume just means build the full-text index from scratch while
+            // leaving the already-ingested documents/artifacts tables alone.
+            tracing::info!("resume requested with no existing chunks; building the full-text index from scratch");
+        }
     }
 
     // Throttle progress logging to once per this many artifacts scanned.
