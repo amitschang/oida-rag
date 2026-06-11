@@ -518,14 +518,18 @@ fn run_reader(
                 text: chunk,
             });
         }
-        // Hand off in `EMBED_BATCH`-sized jobs. Jobs may span documents — the
-        // writer realigns to document boundaries — so small documents still pack
-        // into full embed requests for GPU efficiency.
-        if pending.len() >= EMBED_BATCH
-            && jobs_tx.blocking_send(std::mem::take(&mut pending)).is_err()
-        {
-            // Embed stage went away (it errored); stop reading.
-            return ReaderStats { docs, missing };
+        // Hand off in `EMBED_BATCH`-sized jobs. Drain whole batches in a loop
+        // rather than shipping the leftover `pending` in one shot: a single
+        // large artifact can chunk into thousands of rows, and sending them as
+        // one embed request crashes the Ollama runner. Jobs may span documents —
+        // the writer realigns to document boundaries — so small documents still
+        // pack into full embed requests for GPU efficiency.
+        while pending.len() >= EMBED_BATCH {
+            let job: Vec<ChunkRow> = pending.drain(..EMBED_BATCH).collect();
+            if jobs_tx.blocking_send(job).is_err() {
+                // Embed stage went away (it errored); stop reading.
+                return ReaderStats { docs, missing };
+            }
         }
     }
     if !pending.is_empty() {
