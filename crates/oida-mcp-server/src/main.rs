@@ -3,10 +3,9 @@
 //! Exposes the OIDA index as MCP tools over stdio. All logging goes to stderr
 //! so stdout stays a clean JSON-RPC channel.
 //!
-//! Usage:
-//!   oida-mcp-server                # serve over stdio (builds cache if absent)
-//!   oida-mcp-server build-cache    # build the DuckDB cache and exit
-//!   oida-mcp-server build-cache --force
+//! The index must already be ingested (`oida-cli ingest`); this server never
+//! builds it. If no index is found the server still starts, but the tools
+//! return a helpful error telling the caller to run an ingest.
 
 use std::sync::Arc;
 
@@ -25,11 +24,11 @@ fn load_config() -> anyhow::Result<Config> {
     if let Ok(v) = std::env::var("OIDA_PARQUET") {
         config.parquet_path = v.into();
     }
-    if let Ok(v) = std::env::var("OIDA_CACHE") {
-        config.cache_path = v.into();
-    }
     if let Ok(v) = std::env::var("OIDA_ARTIFACT_ROOT") {
         config.artifact_root = Some(v.into());
+    }
+    if let Ok(v) = std::env::var("OIDA_LANCE") {
+        config.lance_path = v.into();
     }
     Ok(config)
 }
@@ -45,24 +44,29 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = load_config()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.first().map(String::as_str) == Some("build-cache") {
-        let force = args.iter().any(|a| a == "--force");
-        Index::build_cache(&config, force)?;
-        return Ok(());
-    }
+    let index = Arc::new(
+        Index::open(&config)
+            .await
+            .context("opening index (run `oida-cli ingest` if it has not been built)")?,
+    );
 
-    // Ensure the cache exists before serving.
-    if !config.cache_path.exists() {
-        tracing::info!("cache not found; building it (one-time)...");
-        Index::build_cache(&config, false)?;
-    }
+    // Open the hybrid text index if it has been built; degrade gracefully so
+    // the metadata tools still work when it is absent.
+    let hybrid = match oida_core::hybrid::HybridIndex::open(&config).await {
+        Ok(h) => {
+            tracing::info!("hybrid text index loaded");
+            Some(h)
+        }
+        Err(e) => {
+            tracing::info!("hybrid text index unavailable ({e}); hybrid_search disabled");
+            None
+        }
+    };
 
-    let index = Arc::new(Index::open(&config).context("opening index")?);
     tracing::info!("OIDA MCP server ready; serving over stdio");
 
-    let service = OidaServer::new(index, Arc::new(config))
+    let service = OidaServer::new(index, Arc::new(config), hybrid)
         .serve(stdio())
         .await
         .context("starting MCP server")?;

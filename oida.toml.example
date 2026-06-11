@@ -1,11 +1,10 @@
 # OIDA assistant configuration. Copy to `oida.toml` and edit.
 # All fields are optional; the values below are the defaults.
 
-# Source parquet index (the source of truth).
-parquet_path = "oida-index-by-artifact.parquet"
-
-# Persistent DuckDB cache built from the parquet on first run.
-cache_path = "oida.duckdb"
+# Source parquet index (the source of truth). One row per document, with the
+# document's artifacts inline as a list<struct<md5, mediaType, name, size>>.
+# Ingested into LanceDB by `oida-cli ingest`.
+parquet_path = "oida-index.parquet"
 
 # Directory containing artifact files on disk, keyed by artifact_name.
 # Leave unset if you don't have the artifacts yet; artifact-text tools
@@ -15,3 +14,34 @@ cache_path = "oida.duckdb"
 # Local Ollama endpoint and model used to drive tool calling.
 ollama_host = "http://localhost:11434"
 ollama_model = "qwen2.5-coder:latest"
+
+# LanceDB database directory. Holds the document/artifact metadata tables
+# (`oida-cli ingest`) and, when built, the hybrid keyword + semantic text index
+# over artifact OCR text (`oida-cli ingest --full-text`).
+lance_path = "oida-lance"
+
+# Ollama model used to embed document text and queries for semantic search.
+# This is only the default used when building the index; queries always use
+# the model recorded in the index so search can never disagree with the
+# stored vectors. Pull it first, e.g. `ollama pull nomic-embed-text`.
+embed_model = "nomic-embed-text"
+
+# Text chunking for the semantic index. Each artifact's text is split into
+# overlapping byte-bounded chunks before embedding.
+chunk_bytes = 2048
+chunk_overlap = 256
+
+# In-memory write-buffer target (bytes) for the hybrid index build. Embedded
+# chunk batches accumulate to this size, then flush to LanceDB as one fragment.
+# Larger = fewer/bigger fragments (less churn) but higher peak memory. ~1 GiB.
+write_buffer_bytes = 1073741824
+
+# Compact the chunks table after building the hybrid index, merging any
+# leftover small fragments and pruning old versions before indexes are built.
+compact_on_build = true
+
+# In-memory buffer target (bytes) before the `ingest` step flushes a LanceDB
+# fragment for the documents/artifacts tables. Larger = fewer, bigger fragments
+# (better read performance, less metadata) but higher peak memory during ingest.
+# ~512 MiB. Raise on large-memory nodes for fewer files.
+ingest_buffer_bytes = 536870912

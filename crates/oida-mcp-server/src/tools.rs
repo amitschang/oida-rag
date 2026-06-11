@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use oida_core::artifacts::{ArtifactText, read_artifact_text};
-use oida_core::model::{Artifact, Document, RelatedEdge, SearchHit};
+use oida_core::hybrid::HybridIndex;
+use oida_core::model::{Artifact, Document, HybridHit, RelatedEdge, SearchHit};
 use oida_core::{Config, Index, SearchParams, SqlQueryResult, TableSchema};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -33,15 +34,19 @@ const MAX_SQL_ROWS: u32 = 2000;
 pub struct OidaServer {
     index: Arc<Index>,
     config: Arc<Config>,
+    /// The hybrid text index, present only when it has been built. Tools that
+    /// need it return a helpful error when it is absent.
+    hybrid: Arc<Option<HybridIndex>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 impl OidaServer {
-    pub fn new(index: Arc<Index>, config: Arc<Config>) -> Self {
+    pub fn new(index: Arc<Index>, config: Arc<Config>, hybrid: Option<HybridIndex>) -> Self {
         Self {
             index,
             config,
+            hybrid: Arc::new(hybrid),
             tool_router: Self::tool_router(),
         }
     }
@@ -122,9 +127,8 @@ pub struct RelatedResponse {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunSqlRequest {
-    /// A single read-only SQL statement (SELECT/WITH/DESCRIBE/EXPLAIN/SHOW/
-    /// SUMMARIZE). Writes, DDL, COPY, ATTACH, INSTALL/LOAD and multiple
-    /// statements are rejected.
+    /// A single read-only SQL statement (SELECT/WITH/DESCRIBE/EXPLAIN/SHOW).
+    /// Writes, DDL and multiple statements are rejected.
     pub sql: String,
     /// Max rows to return (default 200, max 2000). Excess rows set `truncated`.
     #[serde(default)]
@@ -134,6 +138,22 @@ pub struct RunSqlRequest {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SchemaResponse {
     pub tables: Vec<TableSchema>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HybridSearchRequest {
+    /// Natural-language or keyword query matched against the *contents* of
+    /// documents (OCR text), combining semantic similarity and keyword search.
+    pub query: String,
+    /// Max documents to return (default 10, max 50).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct HybridSearchResponse {
+    pub count: usize,
+    pub hits: Vec<HybridHit>,
 }
 
 /// Convert an `anyhow` error into an MCP internal error.
@@ -164,7 +184,7 @@ impl OidaServer {
             limit,
             offset: req.offset.unwrap_or(0),
         };
-        let hits = self.index.search(&params).map_err(internal)?;
+        let hits = self.index.search(&params).await.map_err(internal)?;
         Ok(Json(SearchResponse {
             count: hits.len(),
             hits,
@@ -181,8 +201,8 @@ impl OidaServer {
         Parameters(req): Parameters<GetDocumentRequest>,
     ) -> Result<Json<DocumentResponse>, McpError> {
         let doc = match (&req.id, &req.bn) {
-            (Some(id), _) => self.index.get_document_by_id(id).map_err(internal)?,
-            (None, Some(bn)) => self.index.get_document_by_bn(bn).map_err(internal)?,
+            (Some(id), _) => self.index.get_document_by_id(id).await.map_err(internal)?,
+            (None, Some(bn)) => self.index.get_document_by_bn(bn).await.map_err(internal)?,
             (None, None) => {
                 return Err(McpError::invalid_params(
                     "provide either `id` or `bn`",
@@ -191,7 +211,7 @@ impl OidaServer {
             }
         };
         let artifacts = match &doc {
-            Some(d) => self.index.get_artifacts(&d.id).map_err(internal)?,
+            Some(d) => self.index.get_artifacts(&d.id).await.map_err(internal)?,
             None => Vec::new(),
         };
         Ok(Json(DocumentResponse {
@@ -237,27 +257,27 @@ impl OidaServer {
         Parameters(req): Parameters<GetRelatedRequest>,
     ) -> Result<Json<RelatedResponse>, McpError> {
         let depth = req.depth.unwrap_or(1).clamp(1, MAX_DEPTH);
-        let edges: Vec<RelatedEdge> = self.index.related(&req.start, depth).map_err(internal)?;
+        let edges: Vec<RelatedEdge> = self.index.related(&req.start, depth).await.map_err(internal)?;
         Ok(Json(RelatedResponse {
             count: edges.len(),
             edges,
         }))
     }
 
-    /// Run an arbitrary read-only SQL query against the cache.
+    /// Run an arbitrary read-only SQL query against the index.
     #[tool(
-        description = "Run a single read-only SQL query against the cache for ad-hoc \
-        counting, grouping, and filtering. Two tables: `documents` (one row per document) \
-        and `artifacts` (one row per artifact, joinable on `documents.id = artifacts.id`). \
-        Key `documents` columns: id, bn, title, industry, collection, genre, date_sent, \
-        date_received, topic, description, keywords, conversation (all VARCHAR), \
-        artifact_count (BIGINT), and list columns custodian, authors, recipients, cc, \
-        attachments, related, mentions, artifact_types (all VARCHAR[] -- use UNNEST to \
-        group by their elements). `artifacts` columns: id, name, media_type, md5 (VARCHAR), \
-        size (BIGINT). Only SELECT/WITH/DESCRIBE/EXPLAIN/SHOW/SUMMARIZE are allowed; writes, \
-        DDL, file/network access and multiple statements are rejected. Returns columns and \
-        JSON-valued rows (lists become arrays); on a bad query the `error` field explains \
-        why so you can fix and retry. Call describe_schema for the full column list."
+        description = "Run a single read-only SQL query (DataFusion SQL dialect) against the \
+        index for ad-hoc counting, grouping, and filtering. Two tables: `documents` (one row \
+        per document) and `artifacts` (one row per artifact, joinable on \
+        `documents.id = artifacts.id`). Key `documents` columns: id, bn, title, industry, \
+        collection, genre, date_sent, date_received, topic, description, keywords, conversation \
+        (all Utf8), artifact_count (Int64), and list columns custodian, authors, recipients, cc, \
+        attachments, related, mentions, artifact_types (all List<Utf8> -- use UNNEST to group by \
+        their elements). `artifacts` columns: id, name, media_type, md5 (Utf8), size (Int64). \
+        Only SELECT/WITH/DESCRIBE/EXPLAIN/SHOW are allowed; writes, DDL and multiple statements \
+        are rejected. Returns columns and JSON-valued rows (lists become arrays); on a bad query \
+        the `error` field explains why so you can fix and retry. Call describe_schema for the \
+        full column list."
     )]
     async fn run_sql(
         &self,
@@ -267,17 +287,73 @@ impl OidaServer {
             .limit
             .unwrap_or(DEFAULT_SQL_ROWS)
             .clamp(1, MAX_SQL_ROWS) as usize;
-        Ok(Json(self.index.run_sql(&req.sql, limit)))
+        Ok(Json(self.index.run_sql(&req.sql, limit).await))
     }
 
-    /// Report the columns and types of the cache tables.
+    /// Report the columns and types of the index tables.
     #[tool(
-        description = "List the columns and DuckDB types of the `documents` and `artifacts` \
-        tables. Use this to write correct run_sql queries."
+        description = "List the columns and Arrow types of the `documents` and `artifacts` \
+        tables (and `chunks` when the full-text index is built). Use this to write correct \
+        run_sql queries."
     )]
     async fn describe_schema(&self) -> Result<Json<SchemaResponse>, McpError> {
-        let tables = self.index.describe_schema().map_err(internal)?;
+        let tables = self.index.describe_schema().await.map_err(internal)?;
         Ok(Json(SchemaResponse { tables }))
+    }
+
+    /// Hybrid keyword + semantic search over document text (OCR contents).
+    #[tool(
+        description = "Search the *contents* of documents (OCR text) using a hybrid of \
+        semantic (vector) and keyword (full-text) matching fused with Reciprocal Rank \
+        Fusion. Unlike search_documents (which matches metadata only), this finds documents \
+        by what they actually say. Returns ranked documents with a matching text snippet and \
+        the source artifact. Requires the hybrid index to be built (oida-cli ingest --full-text)."
+    )]
+    async fn hybrid_search(
+        &self,
+        Parameters(req): Parameters<HybridSearchRequest>,
+    ) -> Result<Json<HybridSearchResponse>, McpError> {
+        let Some(hybrid) = self.hybrid.as_ref() else {
+            return Err(McpError::internal_error(
+                "hybrid text index is not built; run `oida-cli ingest --full-text`",
+                None,
+            ));
+        };
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .clamp(1, MAX_SEARCH_LIMIT) as usize;
+
+        let chunk_hits = hybrid.query(&req.query, limit).await.map_err(internal)?;
+
+        // Hydrate document metadata in one query, preserving rank order.
+        let ids: Vec<String> = chunk_hits.iter().map(|h| h.doc_id.clone()).collect();
+        let docs = self.index.get_documents_by_ids(&ids).await.map_err(internal)?;
+        let by_id: std::collections::HashMap<&str, &Document> =
+            docs.iter().map(|d| (d.id.as_str(), d)).collect();
+
+        let hits: Vec<HybridHit> = chunk_hits
+            .iter()
+            .map(|h| {
+                let doc = by_id.get(h.doc_id.as_str());
+                HybridHit {
+                    id: h.doc_id.clone(),
+                    bn: doc.and_then(|d| d.bn.clone()),
+                    title: doc.and_then(|d| d.title.clone()),
+                    date_sent: doc.and_then(|d| d.date_sent.clone()),
+                    artifact_types: doc.map(|d| d.artifact_types.clone()).unwrap_or_default(),
+                    artifact_count: doc.map(|d| d.artifact_count).unwrap_or(0),
+                    score: h.score,
+                    artifact_name: Some(h.artifact_name.clone()),
+                    snippet: Some(h.snippet.clone()),
+                }
+            })
+            .collect();
+
+        Ok(Json(HybridSearchResponse {
+            count: hits.len(),
+            hits,
+        }))
     }
 }
 

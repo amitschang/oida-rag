@@ -1,16 +1,18 @@
 //! Parquet schema validation.
 //!
-//! The cache builder relies on a known set of columns existing in the source
-//! parquet. We validate them up front so failures are clear rather than
-//! surfacing as cryptic SQL errors deep inside the build.
+//! The ingest relies on a known set of columns existing in the source parquet.
+//! We validate them up front (against the DataFusion-registered `src` table) so
+//! failures are clear rather than surfacing as cryptic SQL errors deep inside
+//! the ingest query.
 
 use std::collections::HashSet;
-use std::path::Path;
 
-use anyhow::{Context, bail};
-use duckdb::Connection;
+use anyhow::{Context, Result, bail};
+use datafusion::prelude::SessionContext;
 
-/// Columns the cache builder reads from the parquet.
+/// Columns the ingest reads from the parquet. The source has one row per
+/// document; `artifact` is a `list<struct<md5, mediaType, name, size>>` holding
+/// the document's artifacts inline.
 pub const REQUIRED_COLUMNS: &[&str] = &[
     "id",
     "bn",
@@ -32,22 +34,21 @@ pub const REQUIRED_COLUMNS: &[&str] = &[
     "attachment",
     "related",
     "men",
-    "artifact_name",
-    "artifact_mediaType",
-    "artifact_size",
-    "artifact_md5",
+    "artifact",
 ];
 
-/// Confirm the parquet exposes every column the cache builder needs.
-pub fn validate_parquet(conn: &Connection, parquet_path: &Path) -> anyhow::Result<()> {
-    let path = parquet_path.to_string_lossy();
-    let mut stmt = conn
-        .prepare("SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet(?))")
-        .context("preparing DESCRIBE for parquet")?;
-    let names: HashSet<String> = stmt
-        .query_map([path.as_ref()], |row| row.get::<_, String>(0))
-        .context("describing parquet schema")?
-        .collect::<Result<_, _>>()?;
+/// Confirm the registered `src` table exposes every column the ingest needs.
+pub(crate) async fn validate_registered(ctx: &SessionContext) -> Result<()> {
+    let df = ctx
+        .sql("SELECT * FROM src LIMIT 0")
+        .await
+        .context("describing parquet schema")?;
+    let names: HashSet<String> = df
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
 
     let missing: Vec<&str> = REQUIRED_COLUMNS
         .iter()
@@ -57,8 +58,7 @@ pub fn validate_parquet(conn: &Connection, parquet_path: &Path) -> anyhow::Resul
 
     if !missing.is_empty() {
         bail!(
-            "parquet {} is missing required columns: {}",
-            parquet_path.display(),
+            "parquet is missing required columns: {}",
             missing.join(", ")
         );
     }

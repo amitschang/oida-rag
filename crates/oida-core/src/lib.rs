@@ -1,18 +1,25 @@
-//! Core domain logic for the OIDA assistant: configuration, the DuckDB-backed
-//! index (search + relationship graph), and artifact access. This crate is
-//! transport-agnostic — it knows nothing about MCP or Ollama.
+//! Core domain logic for the OIDA assistant: configuration, the LanceDB-backed
+//! index (search + relationship graph + hybrid text search), and artifact
+//! access. This crate is transport-agnostic — it knows nothing about MCP or
+//! Ollama.
 
 pub mod artifacts;
 pub mod config;
+pub mod embed;
 pub mod graph;
+pub mod hybrid;
 pub mod index;
+pub mod ingest;
 pub mod model;
 pub mod schema;
 pub mod search;
 pub mod sql;
 
 pub use config::Config;
+pub use embed::Embedder;
+pub use hybrid::{HybridIndex, IndexStats};
 pub use index::Index;
-pub use model::{Artifact, Document, RelatedEdge, RelationKind, SearchHit};
+pub use ingest::MetadataStats;
+pub use model::{Artifact, Document, HybridHit, RelatedEdge, RelationKind, SearchHit};
 pub use model::{ColumnInfo, SqlQueryResult, TableSchema};
 pub use search::SearchParams;

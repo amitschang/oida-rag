@@ -10,9 +10,16 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-duckdb.workspace = true
 toml.workspace = true
 schemars.workspace = true
+lancedb.workspace = true
+lance.workspace = true
+datafusion.workspace = true
+arrow.workspace = true
+lance-index.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

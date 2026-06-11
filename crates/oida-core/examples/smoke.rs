@@ -3,7 +3,8 @@
 
 use oida_core::{Config, Index, SearchParams};
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter("info")
@@ -11,20 +12,22 @@ fn main() -> anyhow::Result<()> {
 
     let config = Config::default();
 
-    if !config.cache_path.exists() {
-        eprintln!("== building cache (one-time) ==");
-        Index::build_cache(&config, false)?;
+    if !Index::is_ingested(&config).await {
+        eprintln!("== ingesting metadata (one-time) ==");
+        Index::ingest_metadata(&config, false).await?;
     }
 
-    let index = Index::open(&config)?;
+    let index = Index::open(&config).await?;
 
     let query = std::env::args().nth(1).unwrap_or_else(|| "report".into());
     eprintln!("== search: {query:?} ==");
-    let hits = index.search(&SearchParams {
-        query,
-        limit: 5,
-        ..Default::default()
-    })?;
+    let hits = index
+        .search(&SearchParams {
+            query,
+            limit: 5,
+            ..Default::default()
+        })
+        .await?;
     for h in &hits {
         println!(
             "[{}] id={} bn={:?} fields={:?} types={:?}\n      title={:?}",
@@ -35,12 +38,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(first) = hits.first() {
         let target = std::env::var("OIDA_RELATED_ID").unwrap_or_else(|_| first.id.clone());
         eprintln!("== get_document: {target} ==");
-        if let Some(doc) = index.get_document_by_id(&target)? {
+        if let Some(doc) = index.get_document_by_id(&target).await? {
             println!(
                 "doc id={} bn={:?} authors={:?} attachments={:?} conversation={:?}",
                 doc.id, doc.bn, doc.authors, doc.attachments, doc.conversation
             );
-            for a in index.get_artifacts(&doc.id)? {
+            for a in index.get_artifacts(&doc.id).await? {
                 println!(
                     "  artifact {} [{:?}] {} bytes",
                     a.name,
@@ -51,7 +54,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         eprintln!("== related (depth 1): {target} ==");
-        let edges = index.related(&target, 1)?;
+        let edges = index.related(&target, 1).await?;
         for e in edges.iter().take(10) {
             println!(
                 "  {} -> {} ({}) neighbor={:?}",

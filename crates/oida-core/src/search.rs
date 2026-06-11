@@ -1,21 +1,13 @@
-//! Keyword search over the cached `documents` table.
+//! Keyword search over the `documents` table.
 //!
-//! v1 uses case-insensitive substring matching (`LIKE`) over the key metadata
-//! fields, ranking documents by how many distinct query terms they contain.
-//! Matching is metadata-only; artifact OCR text is not indexed in v1.
+//! Candidate documents are found with LanceDB's full-text (BM25) index over the
+//! concatenated `search_text` column, then scored and ranked in Rust by the
+//! number of distinct query terms they contain — preserving the original
+//! term-count ranking and per-field provenance. Matching is metadata-only;
+//! artifact OCR text is searched by [`crate::hybrid`].
 
-use duckdb::ToSql;
-
-use crate::index::{DOC_COLS, Index, row_to_document};
+use crate::index::Index;
 use crate::model::{Document, SearchHit};
-
-/// Concatenation of the searchable metadata fields, lowercased for matching.
-const HAYSTACK: &str = "lower(concat_ws(' ', \
-     coalesce(title, ''), coalesce(bn, ''), coalesce(topic, ''), \
-     coalesce(description, ''), coalesce(keywords, ''), \
-     coalesce(array_to_string(authors, ' '), ''), \
-     coalesce(array_to_string(custodian, ' '), ''), \
-     coalesce(array_to_string(recipients, ' '), '')))";
 
 /// Parameters accepted by [`Index::search`].
 #[derive(Debug, Clone)]
@@ -46,96 +38,63 @@ impl Default for SearchParams {
 
 impl Index {
     /// Keyword-search documents, returning ranked hits with provenance.
-    pub fn search(&self, params: &SearchParams) -> anyhow::Result<Vec<SearchHit>> {
+    pub async fn search(&self, params: &SearchParams) -> anyhow::Result<Vec<SearchHit>> {
         let terms = normalize_terms(&params.query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        // One scoring term per query term: 1 if the haystack contains it.
-        let score_expr = terms
-            .iter()
-            .map(|_| format!("(CASE WHEN {HAYSTACK} LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)"))
-            .collect::<Vec<_>>()
-            .join(" + ");
+        // Over-fetch FTS candidates so post-filtering and pagination still have
+        // enough rows to satisfy `offset + limit`.
+        let want = params.offset as usize + params.limit as usize;
+        let fetch = want.saturating_mul(4).max(want).max(50);
+        let docs = self.documents_fts(&params.query, fetch).await?;
 
-        // Owned bind values, kept alive for the duration of the query.
-        let like_params: Vec<String> = terms
-            .iter()
-            .map(|t| format!("%{}%", escape_like(t)))
+        let mut hits: Vec<SearchHit> = docs
+            .into_iter()
+            .filter(|d| passes_filters(d, params))
+            .filter_map(|d| {
+                let (score, matched) = score_document(&d, &terms);
+                (score > 0).then(|| to_hit(d, score, matched))
+            })
             .collect();
 
-        let mut filters = String::new();
-        let mut filter_vals: Vec<String> = Vec::new();
-        if let Some(mt) = &params.media_type {
-            filters.push_str(" AND id IN (SELECT id FROM artifacts WHERE media_type = ?)");
-            filter_vals.push(mt.clone());
-        }
-        if let Some(c) = &params.custodian {
-            filters.push_str(" AND array_to_string(custodian, ' ') ILIKE ?");
-            filter_vals.push(format!("%{}%", escape_like(c)));
-        }
+        // Rank by term count, then by how many artifacts the document has.
+        hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(b.artifact_count.cmp(&a.artifact_count))
+        });
 
-        let sql = format!(
-            "WITH scored AS (
-                 SELECT {DOC_COLS}, ({score_expr}) AS score
-                 FROM documents
-                 WHERE true{filters}
-             )
-             SELECT * FROM scored
-             WHERE score > 0
-             ORDER BY score DESC, artifact_count DESC
-             LIMIT ? OFFSET ?"
-        );
-
-        // Bind order: scoring terms, then filters, then limit/offset.
-        let limit = params.limit as i64;
-        let offset = params.offset as i64;
-        let mut binds: Vec<&dyn ToSql> = Vec::new();
-        for p in &like_params {
-            binds.push(p);
-        }
-        for v in &filter_vals {
-            binds.push(v);
-        }
-        binds.push(&limit);
-        binds.push(&offset);
-
-        let conn = self.conn_lock();
-        let mut stmt = conn.prepare(&sql)?;
-        // `scored` projects DOC_COLS (0..=20) followed by score (21).
-        let rows = stmt.query_map(binds.as_slice(), |row| {
-            let doc = row_to_document(row)?;
-            let score: i64 = row.get(21)?;
-            Ok((doc, score as u32))
-        })?;
-
-        let mut hits = Vec::new();
-        for r in rows {
-            let (doc, score) = r?;
-            hits.push(to_hit(doc, score, &terms));
-        }
-        Ok(hits)
+        let start = (params.offset as usize).min(hits.len());
+        let end = (start + params.limit as usize).min(hits.len());
+        Ok(hits[start..end].to_vec())
     }
 }
 
-/// Build a [`SearchHit`] from a matched document, computing field provenance.
-fn to_hit(doc: Document, score: u32, terms: &[String]) -> SearchHit {
-    let matched_fields = matched_fields(&doc, terms);
-    SearchHit {
-        id: doc.id,
-        bn: doc.bn,
-        title: doc.title,
-        date_sent: doc.date_sent,
-        artifact_types: doc.artifact_types,
-        artifact_count: doc.artifact_count,
-        score,
-        matched_fields,
+/// Apply the optional media-type and custodian filters to a candidate document.
+fn passes_filters(doc: &Document, params: &SearchParams) -> bool {
+    if let Some(mt) = &params.media_type
+        && !doc.artifact_types.iter().any(|t| t == mt)
+    {
+        return false;
     }
+    if let Some(c) = &params.custodian {
+        let needle = c.to_lowercase();
+        if !doc
+            .custodian
+            .iter()
+            .any(|v| v.to_lowercase().contains(&needle))
+        {
+            return false;
+        }
+    }
+    true
 }
 
-/// Determine which named fields contained at least one query term.
-fn matched_fields(doc: &Document, terms: &[String]) -> Vec<String> {
+/// Count the distinct query terms present in the document's searchable fields
+/// and report which named fields contributed.
+fn score_document(doc: &Document, terms: &[String]) -> (u32, Vec<String>) {
     let fields: [(&str, String); 8] = [
         ("title", opt(&doc.title)),
         ("bn", opt(&doc.bn)),
@@ -146,14 +105,39 @@ fn matched_fields(doc: &Document, terms: &[String]) -> Vec<String> {
         ("custodian", doc.custodian.join(" ")),
         ("recipients", doc.recipients.join(" ")),
     ];
-    fields
+    let lowered: Vec<(&str, String)> = fields
+        .iter()
+        .map(|(name, val)| (*name, val.to_lowercase()))
+        .collect();
+
+    let haystack = lowered
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let score = terms.iter().filter(|t| haystack.contains(t.as_str())).count() as u32;
+
+    let matched = lowered
         .into_iter()
-        .filter(|(_, val)| {
-            let low = val.to_lowercase();
-            terms.iter().any(|t| low.contains(t.as_str()))
-        })
+        .filter(|(_, val)| terms.iter().any(|t| val.contains(t.as_str())))
         .map(|(name, _)| name.to_string())
-        .collect()
+        .collect();
+
+    (score, matched)
+}
+
+/// Build a [`SearchHit`] from a matched document.
+fn to_hit(doc: Document, score: u32, matched_fields: Vec<String>) -> SearchHit {
+    SearchHit {
+        id: doc.id,
+        bn: doc.bn,
+        title: doc.title,
+        date_sent: doc.date_sent,
+        artifact_types: doc.artifact_types,
+        artifact_count: doc.artifact_count,
+        score,
+        matched_fields,
+    }
 }
 
 fn opt(s: &Option<String>) -> String {
@@ -170,9 +154,44 @@ fn normalize_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Escape `LIKE` metacharacters so terms match literally (with `ESCAPE '\'`).
-fn escape_like(term: &str) -> String {
-    term.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_and_dedups_terms() {
+        assert_eq!(normalize_terms("Foo foo BAR"), vec!["foo", "bar"]);
+        assert!(normalize_terms("   ").is_empty());
+    }
+
+    #[test]
+    fn scores_by_distinct_term_presence() {
+        let doc = Document {
+            title: Some("Quarterly Report".into()),
+            authors: vec!["Jane Doe".into()],
+            ..Document::default()
+        };
+        let (score, matched) = score_document(&doc, &["report".into(), "jane".into()]);
+        assert_eq!(score, 2);
+        assert!(matched.contains(&"title".to_string()));
+        assert!(matched.contains(&"authors".to_string()));
+    }
+
+    #[test]
+    fn media_type_filter_uses_artifact_types() {
+        let doc = Document {
+            artifact_types: vec!["application/pdf".into()],
+            ..Document::default()
+        };
+        let yes = SearchParams {
+            media_type: Some("application/pdf".into()),
+            ..SearchParams::default()
+        };
+        let no = SearchParams {
+            media_type: Some("text/plain".into()),
+            ..SearchParams::default()
+        };
+        assert!(passes_filters(&doc, &yes));
+        assert!(!passes_filters(&doc, &no));
+    }
 }

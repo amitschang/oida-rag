@@ -75,6 +75,27 @@ pub struct SearchHit {
     pub matched_fields: Vec<String>,
 }
 
+/// A hybrid (keyword + semantic) search hit over artifact text.
+///
+/// Results are folded to one entry per document: `score` is the document's
+/// fused (RRF) relevance and `snippet` is the best-matching passage of its
+/// OCR/plain text. Document metadata is hydrated from the cache.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HybridHit {
+    pub id: String,
+    pub bn: Option<String>,
+    pub title: Option<String>,
+    pub date_sent: Option<String>,
+    pub artifact_types: Vec<String>,
+    pub artifact_count: u64,
+    /// Fused relevance score (higher is better) from Reciprocal Rank Fusion.
+    pub score: f32,
+    /// The artifact file the best-matching passage came from.
+    pub artifact_name: Option<String>,
+    /// Best-matching passage of the document's text, for context.
+    pub snippet: Option<String>,
+}
+
 /// The kind of relationship connecting two documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -115,9 +136,9 @@ pub struct RelatedEdge {
 ///
 /// On success, `columns` names the projected columns and `rows` holds one
 /// JSON-valued cell per column (lists/structs become JSON arrays/objects).
-/// On failure (invalid or rejected SQL, or a DuckDB execution error), `error`
-/// carries a human-readable message and `rows` is empty — letting the model
-/// read the error and correct its query.
+/// On failure (invalid or rejected SQL, or a DataFusion execution error),
+/// `error` carries a human-readable message and `rows` is empty — letting the
+/// model read the error and correct its query.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SqlQueryResult {
     /// Column names in projection order.
@@ -147,7 +168,7 @@ impl SqlQueryResult {
 pub struct ColumnInfo {
     /// Column name.
     pub name: String,
-    /// DuckDB type, e.g. `VARCHAR`, `BIGINT`, `VARCHAR[]`.
+    /// Arrow type, e.g. `Utf8`, `Int64`, `List(Utf8)`.
     pub type_: String,
 }
 

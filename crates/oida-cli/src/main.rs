@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
-use clap::Parser;
-use oida_core::Config;
+use clap::{Parser, Subcommand};
+use oida_core::{Config, Embedder, Index, hybrid};
 
 mod agent;
 mod mcp_client;
@@ -26,6 +26,14 @@ struct Args {
     #[arg(long, env = "OIDA_CONFIG", default_value = "oida.toml")]
     config: PathBuf,
 
+    /// Path to the source parquet index (overrides config).
+    #[arg(long, env = "OIDA_PARQUET")]
+    parquet_path: Option<PathBuf>,
+
+    /// Path to the LanceDB database directory (overrides config).
+    #[arg(long, env = "OIDA_LANCE")]
+    lance_path: Option<PathBuf>,
+
     /// Ollama model to use (overrides config).
     #[arg(long, env = "OIDA_MODEL")]
     model: Option<String>,
@@ -38,6 +46,30 @@ struct Args {
     #[arg(long, env = "OIDA_ARTIFACT_ROOT")]
     artifact_root: Option<PathBuf>,
 
+    /// Embedding model for the full-text index (overrides config).
+    #[arg(long, env = "OIDA_EMBED_MODEL")]
+    embed_model: Option<String>,
+
+    /// Target size, in bytes, of each embedded text chunk (overrides config).
+    #[arg(long, env = "OIDA_CHUNK_BYTES")]
+    chunk_bytes: Option<usize>,
+
+    /// Overlap, in bytes, between adjacent text chunks (overrides config).
+    #[arg(long, env = "OIDA_CHUNK_OVERLAP")]
+    chunk_overlap: Option<usize>,
+
+    /// Write-buffer target, in bytes, for the hybrid index build (overrides config).
+    #[arg(long, env = "OIDA_WRITE_BUFFER_BYTES")]
+    write_buffer_bytes: Option<usize>,
+
+    /// Compact the chunks table after a hybrid build (overrides config).
+    #[arg(long, env = "OIDA_COMPACT_ON_BUILD")]
+    compact_on_build: Option<bool>,
+
+    /// Buffer target, in bytes, before the metadata ingest flushes (overrides config).
+    #[arg(long, env = "OIDA_INGEST_BUFFER_BYTES")]
+    ingest_buffer_bytes: Option<usize>,
+
     /// Path to the oida-mcp-server binary (defaults to a sibling of this exe).
     #[arg(long, env = "OIDA_SERVER_BIN")]
     server_bin: Option<PathBuf>,
@@ -45,6 +77,69 @@ struct Args {
     /// Run a single query non-interactively and exit.
     #[arg(long)]
     once: Option<String>,
+
+    /// Subcommand to run. When omitted, starts an interactive chat session.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Top-level subcommands. Chat is the default when none is given.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Ingest the parquet into LanceDB (required before chatting).
+    ///
+    /// Loads document/artifact metadata always; pass `--full-text` to also
+    /// build the hybrid keyword + semantic text index over the OCR artifacts.
+    Ingest {
+        /// Also build the hybrid full-text/semantic index.
+        #[arg(long)]
+        full_text: bool,
+        /// Replace an existing index instead of failing.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show statistics about the ingested index.
+    Stats,
+}
+
+
+/// Overlay CLI-flag / env-var values onto the config loaded from file. Each
+/// field is only touched when the caller supplied it, so the precedence is
+/// defaults < config file < env var < CLI flag (clap resolves flag-over-env).
+fn apply_overrides(config: &mut Config, args: &Args) {
+    if let Some(p) = &args.parquet_path {
+        config.parquet_path = p.clone();
+    }
+    if let Some(p) = &args.lance_path {
+        config.lance_path = p.clone();
+    }
+    if let Some(m) = &args.model {
+        config.ollama_model = m.clone();
+    }
+    if let Some(h) = &args.ollama_host {
+        config.ollama_host = h.clone();
+    }
+    if let Some(r) = &args.artifact_root {
+        config.artifact_root = Some(r.clone());
+    }
+    if let Some(m) = &args.embed_model {
+        config.embed_model = m.clone();
+    }
+    if let Some(v) = args.chunk_bytes {
+        config.chunk_bytes = v;
+    }
+    if let Some(v) = args.chunk_overlap {
+        config.chunk_overlap = v;
+    }
+    if let Some(v) = args.write_buffer_bytes {
+        config.write_buffer_bytes = v;
+    }
+    if let Some(v) = args.compact_on_build {
+        config.compact_on_build = v;
+    }
+    if let Some(v) = args.ingest_buffer_bytes {
+        config.ingest_buffer_bytes = v;
+    }
 }
 
 /// Resolve the server binary path, defaulting to a sibling of the current exe.
@@ -71,25 +166,36 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+                .unwrap_or_else(|_| "warn,oida_core=info".into()),
         )
         .init();
 
     let args = Args::parse();
 
     let mut config = Config::load(&args.config)?;
-    if let Some(m) = &args.model {
-        config.ollama_model = m.clone();
+    apply_overrides(&mut config, &args);
+
+    // Dispatch management subcommands before touching the MCP server.
+    match &args.command {
+        Some(Command::Ingest { full_text, force }) => {
+            return run_ingest(&config, *full_text, *force).await;
+        }
+        Some(Command::Stats) => return run_stats(&config).await,
+        None => {}
     }
-    if let Some(h) = &args.ollama_host {
-        config.ollama_host = h.clone();
-    }
-    if let Some(r) = &args.artifact_root {
-        config.artifact_root = Some(r.clone());
+
+    // Chatting requires an ingested index; never build it implicitly.
+    if !Index::is_ingested(&config).await {
+        eprintln!(
+            "No index found at {}.\nRun `oida-cli ingest` (add --full-text for semantic search) \
+             before chatting.",
+            config.lance_path.display()
+        );
+        std::process::exit(1);
     }
 
     let server_bin = resolve_server_bin(args.server_bin.clone())?;
-    eprintln!("Starting OIDA MCP server: {} (first run builds the cache)…", server_bin.display());
+    eprintln!("Starting OIDA MCP server: {}…", server_bin.display());
 
     let mcp = McpClient::connect(server_bin).await?;
     let tools = mcp.list_tools().await?;
@@ -107,3 +213,55 @@ async fn main() -> anyhow::Result<()> {
     agent.shutdown().await;
     result
 }
+
+/// Run the `ingest` subcommand: load metadata, then optionally the full-text
+/// index, reporting progress to stderr.
+async fn run_ingest(config: &Config, full_text: bool, force: bool) -> anyhow::Result<()> {
+    eprintln!("Ingesting metadata from {}…", config.parquet_path.display());
+    let stats = Index::ingest_metadata(config, force)
+        .await
+        .context("ingesting metadata")?;
+    eprintln!(
+        "Ingested {} documents and {} artifacts.",
+        stats.documents, stats.artifacts
+    );
+
+    if full_text {
+        let index = Index::open(config).await.context("opening index")?;
+        let model = &config.embed_model;
+        let embedder = Embedder::new(&config.ollama_host, model.to_string())?;
+        eprintln!("Building hybrid text index with embed model '{model}'…");
+        let hstats = hybrid::build(config, &index, &embedder, force).await?;
+        eprintln!(
+            "Indexed {} chunks across {} documents (dim {}).",
+            hstats.chunks, hstats.documents, hstats.dim
+        );
+    }
+    Ok(())
+}
+
+/// Run the `stats` subcommand: report index row counts and hybrid metadata.
+async fn run_stats(config: &Config) -> anyhow::Result<()> {
+    let index = Index::open(config).await.context("opening index")?;
+    let (documents, artifacts) = index.counts().await?;
+    println!("OIDA index ({})", config.lance_path.display());
+    println!("  documents:      {documents}");
+    println!("  artifacts:      {artifacts}");
+
+    match hybrid::HybridIndex::open(config).await {
+        Ok(h) => {
+            let s = h.stats().await?;
+            println!("  full-text:      built");
+            println!("    chunks:       {}", s.chunks);
+            println!("    embed model:  {}", s.embed_model);
+            println!("    vector dim:   {}", s.dim);
+            println!("    model digest: {}", s.model_digest);
+            println!("    chunk bytes:  {}", s.chunk_bytes);
+            println!("    chunk overlap:{}", s.chunk_overlap);
+            println!("    built at:     {} (unix)", s.built_at);
+        }
+        Err(_) => println!("  full-text:      not built (run `oida-cli ingest --full-text`)"),
+    }
+    Ok(())
+}
+
