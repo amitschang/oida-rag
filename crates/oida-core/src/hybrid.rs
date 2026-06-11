@@ -263,6 +263,8 @@ pub async fn build(
     let mut buffer_bytes: usize = 0;
     let mut chunk_count: u64 = 0;
     let mut doc_count: u64 = 0;
+    // Referenced artifacts whose file was not on disk (skipped, not fatal).
+    let mut missing: u64 = 0;
     let mut last_doc: Option<String> = None;
     // Throttle progress logging to once per this many artifacts scanned.
     const PROGRESS_EVERY: usize = 500;
@@ -275,24 +277,29 @@ pub async fn build(
         if scanned > 0 && scanned % PROGRESS_EVERY == 0 {
             tracing::info!(
                 "embedding progress: {scanned}/{total_artifacts} artifacts, \
-                 {chunk_count} chunks embedded so far"
+                 {chunk_count} chunks embedded, {missing} files missing so far"
             );
         }
         // u64::MAX / 2 reads the whole file without risking an offset overflow.
         let loaded = read_artifact_text(config, name, media_type.as_deref(), 0, u64::MAX / 2);
         match loaded.status {
             ArtifactTextStatus::TextLoaded => {}
-            // A referenced file that is not on disk means the artifact_root is
-            // wrong or the data is incomplete — either way the index would be
-            // silently partial, so fail loudly instead of skipping.
+            // A referenced file may legitimately be absent (e.g. redacted
+            // documents are pulled from disk), so a miss is not fatal — but it
+            // does leave the index partial, so count every one and warn on the
+            // first so a wrong artifact_root is still obvious. The end-of-build
+            // summary reports the total.
             ArtifactTextStatus::ArtifactFileMissing => {
-                let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
-                bail!(
-                    "artifact '{name}' (doc {doc_id}) is referenced but not found at {}; \
-                     check artifact_root ({})",
-                    artifact_path(root, name).display(),
-                    root.display()
-                );
+                if missing == 0 {
+                    let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
+                    tracing::warn!(
+                        "artifact '{name}' (doc {doc_id}) not found at {}; \
+                         skipping it and any further missing files (e.g. redacted)",
+                        artifact_path(root, name).display(),
+                    );
+                }
+                missing += 1;
+                continue;
             }
             // Not a text type we read in v1 (the listing should already exclude
             // these, but skip defensively rather than fail the whole build).
@@ -331,6 +338,14 @@ pub async fn build(
     }
     if !buffer.is_empty() {
         write_buffer(&db, &mut table, &mut buffer).await?;
+    }
+
+    if missing > 0 {
+        let pct = 100.0 * missing as f64 / total_artifacts.max(1) as f64;
+        tracing::warn!(
+            "{missing}/{total_artifacts} referenced artifact files ({pct:.1}%) were missing \
+             and skipped (e.g. redacted documents); the index is built from the rest"
+        );
     }
 
     let table = table.ok_or_else(|| {
