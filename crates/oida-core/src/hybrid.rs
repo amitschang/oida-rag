@@ -129,7 +129,8 @@ impl HybridIndex {
             .execute()
             .await
             .context("opening chunks table")?;
-        let embedder = Embedder::new(&config.ollama_host, meta.embed_model.clone())?;
+        let embedder =
+            Embedder::new(&config.ollama_host, meta.embed_model.clone(), config.embed_num_ctx)?;
         Ok(Self {
             table,
             embedder,

@@ -15,16 +15,23 @@ pub struct Embedder {
     http: reqwest::Client,
     base: String,
     model: String,
+    /// Context window (in tokens) sent as `options.num_ctx` on every embed
+    /// request, or `None` to omit it and defer to the model/server default
+    /// (Ollama's default is 2048). Raising this above the worst-case chunk's
+    /// token count prevents the runner crash an over-long input would cause.
+    num_ctx: Option<usize>,
 }
 
 impl Embedder {
-    /// Build a client for `model` against the Ollama server at `base`.
-    pub fn new(base: &str, model: impl Into<String>) -> Result<Self> {
+    /// Build a client for `model` against the Ollama server at `base`, sending
+    /// `num_ctx` as the per-request context window (or omitting it when `None`).
+    pub fn new(base: &str, model: impl Into<String>, num_ctx: Option<usize>) -> Result<Self> {
         reqwest::Url::parse(base).with_context(|| format!("invalid ollama host {base}"))?;
         Ok(Self {
             http: reqwest::Client::new(),
             base: base.trim_end_matches('/').to_string(),
             model: model.into(),
+            num_ctx,
         })
     }
 
@@ -45,6 +52,7 @@ impl Embedder {
         let body = EmbedRequest {
             model: &self.model,
             input: inputs,
+            options: self.num_ctx.map(|num_ctx| EmbedOptions { num_ctx }),
         };
         let response = self
             .http
@@ -53,6 +61,9 @@ impl Embedder {
             .send()
             .await
             .with_context(|| format!("sending embed request to {url}"))?;
+        if !response.status().is_success() {
+            dump_failing_request(&body);
+        }
         let response = check_status(response, "/api/embed").await?;
         let parsed: EmbedResponse = response
             .json()
@@ -146,6 +157,26 @@ async fn check_status(response: reqwest::Response, endpoint: &str) -> Result<req
     bail!("ollama returned {status} for {endpoint}: {detail}");
 }
 
+/// On an embed failure, write the exact request body to a file so the offending
+/// input can be isolated and replayed (e.g. `curl -d @oida-failed-embed.json`).
+/// Ollama's runner can crash on a specific chunk — typically one that tokenizes
+/// past the model's context window — and the error alone doesn't say which of
+/// the batch's inputs did it. Best-effort: a dump failure must not mask the
+/// original embed error, so I/O errors here are only logged.
+fn dump_failing_request(body: &EmbedRequest<'_>) {
+    const PATH: &str = "oida-failed-embed.json";
+    match serde_json::to_vec_pretty(body) {
+        Ok(json) => match std::fs::write(PATH, &json) {
+            Ok(()) => tracing::error!(
+                "embed request failed; dumped {} inputs to {PATH} for isolation",
+                body.input.len()
+            ),
+            Err(e) => tracing::error!("embed request failed; could not write {PATH}: {e}"),
+        },
+        Err(e) => tracing::error!("embed request failed; could not serialize request: {e}"),
+    }
+}
+
 /// The `{"error": "..."}` payload Ollama returns alongside an error status.
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
@@ -158,6 +189,17 @@ struct ErrorBody {
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    /// Per-request model options. Omitted entirely when there is nothing to set
+    /// so the wire format is unchanged from the no-options case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<EmbedOptions>,
+}
+
+/// The slice of Ollama's per-request `options` the embedder sets.
+#[derive(Debug, Serialize)]
+struct EmbedOptions {
+    /// Context window in tokens (`num_ctx`).
+    num_ctx: usize,
 }
 
 /// The subset of the embed response we consume.
@@ -182,4 +224,31 @@ struct TagEntry {
     model: Option<String>,
     #[serde(default)]
     digest: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_json(num_ctx: Option<usize>) -> serde_json::Value {
+        let input = ["hello".to_string()];
+        let body = EmbedRequest {
+            model: "nomic-embed-text",
+            input: &input,
+            options: num_ctx.map(|num_ctx| EmbedOptions { num_ctx }),
+        };
+        serde_json::to_value(&body).unwrap()
+    }
+
+    #[test]
+    fn sends_num_ctx_as_options_when_set() {
+        let value = request_json(Some(8192));
+        assert_eq!(value["options"]["num_ctx"], 8192);
+    }
+
+    #[test]
+    fn omits_options_when_num_ctx_is_none() {
+        let value = request_json(None);
+        assert!(value.get("options").is_none());
+    }
 }

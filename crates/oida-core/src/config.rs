@@ -39,6 +39,12 @@ pub const DEFAULT_INGEST_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 /// across request round-trips. To benefit, the Ollama server must allow at
 /// least this many parallel requests (`OLLAMA_NUM_PARALLEL`).
 pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
+/// Default context window (tokens) sent as `options.num_ctx` on embed requests.
+/// `nomic-embed-text` supports up to 8192; Ollama otherwise defaults to 2048,
+/// which a dense chunk can tokenize past, crashing the model runner. Since a
+/// chunk is bounded to `DEFAULT_CHUNK_BYTES` bytes (≤ that many tokens), 8192
+/// leaves ample headroom so no chunk can overflow the context.
+pub const DEFAULT_EMBED_NUM_CTX: Option<usize> = Some(8192);
 
 /// Runtime configuration.
 ///
@@ -86,6 +92,11 @@ pub struct Config {
     /// hybrid index, overlapping Ollama round-trips to keep the GPU saturated.
     /// Requires a matching `OLLAMA_NUM_PARALLEL` on the server to take effect.
     pub embed_concurrency: usize,
+    /// Context window, in tokens, sent as `options.num_ctx` on every embed
+    /// request, or `None` to omit it and use the model/server default (2048 in
+    /// Ollama). Set above the worst-case chunk's token count to keep a long
+    /// input from overflowing the runner's context and crashing it.
+    pub embed_num_ctx: Option<usize>,
 }
 
 impl Default for Config {
@@ -103,6 +114,7 @@ impl Default for Config {
             compact_on_build: DEFAULT_COMPACT_ON_BUILD,
             ingest_buffer_bytes: DEFAULT_INGEST_BUFFER_BYTES,
             embed_concurrency: DEFAULT_EMBED_CONCURRENCY,
+            embed_num_ctx: DEFAULT_EMBED_NUM_CTX,
         }
     }
 }
