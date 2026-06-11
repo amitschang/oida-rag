@@ -33,6 +33,12 @@ pub const DEFAULT_COMPACT_ON_BUILD: bool = true;
 /// a LanceDB fragment. Larger values yield fewer, bigger fragments (better read
 /// performance, less metadata) at the cost of higher peak memory during ingest.
 pub const DEFAULT_INGEST_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+/// Default number of embed requests kept in flight concurrently while building
+/// the hybrid index. The build pipelines reading/chunking, embedding, and
+/// writing; this is how many Ollama embed calls overlap to keep the GPU fed
+/// across request round-trips. To benefit, the Ollama server must allow at
+/// least this many parallel requests (`OLLAMA_NUM_PARALLEL`).
+pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
 
 /// Runtime configuration.
 ///
@@ -76,6 +82,10 @@ pub struct Config {
     /// LanceDB fragment. Larger = fewer, bigger fragments (better reads) but
     /// higher peak memory during ingest.
     pub ingest_buffer_bytes: usize,
+    /// Number of embed requests kept concurrently in flight while building the
+    /// hybrid index, overlapping Ollama round-trips to keep the GPU saturated.
+    /// Requires a matching `OLLAMA_NUM_PARALLEL` on the server to take effect.
+    pub embed_concurrency: usize,
 }
 
 impl Default for Config {
@@ -92,6 +102,7 @@ impl Default for Config {
             write_buffer_bytes: DEFAULT_WRITE_BUFFER_BYTES,
             compact_on_build: DEFAULT_COMPACT_ON_BUILD,
             ingest_buffer_bytes: DEFAULT_INGEST_BUFFER_BYTES,
+            embed_concurrency: DEFAULT_EMBED_CONCURRENCY,
         }
     }
 }

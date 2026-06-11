@@ -28,7 +28,8 @@ use arrow::array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use tokio::sync::mpsc;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::FtsIndexBuilder;
@@ -267,20 +268,11 @@ pub async fn build(
     let total_artifacts = artifacts.len();
     tracing::info!("indexing text from {total_artifacts} artifacts");
 
-    let mut table: Option<Table> = None;
-    let mut dim: Option<usize> = None;
-    // `pending` accumulates chunk rows for the next (small) Ollama embed
-    // request; `buffer` accumulates the resulting embedded batches and is only
-    // flushed to LanceDB once it crosses `write_buffer_bytes`, so each
-    // `Table::add` writes one large fragment instead of one per embed batch.
-    let mut pending: Vec<ChunkRow> = Vec::new();
-    let mut buffer: Vec<RecordBatch> = Vec::new();
-    let mut buffer_bytes: usize = 0;
-    let mut chunk_count: u64 = 0;
-    let mut doc_count: u64 = 0;
-    // Referenced artifacts whose file was not on disk (skipped, not fatal).
-    let mut missing: u64 = 0;
-    let mut last_doc: Option<String> = None;
+    // Resume seeds: a prior (interrupted) build's already-indexed documents are
+    // skipped, and its chunk/doc/dim counts carry into the totals.
+    let mut resumed_table: Option<Table> = None;
+    let mut seed_dim: Option<usize> = None;
+    let mut prior_chunks: u64 = 0;
     // Documents already present from a prior (interrupted) build; skipped here.
     let mut done: HashSet<String> = HashSet::new();
 
@@ -296,15 +288,13 @@ pub async fn build(
                 .execute()
                 .await
                 .context("opening chunks table to resume")?;
-            // Seed the dimension from the stored vectors so `embed_rows` will
+            // Seed the dimension from the stored vectors so the embed stage will
             // catch a model swap (a differently-sized embedding) on the first
             // new batch.
-            dim = Some(vector_dim(&t).await?);
+            seed_dim = Some(vector_dim(&t).await?);
             done = existing_doc_ids(&t).await?;
-            let prior_chunks = t.count_rows(None).await.context("counting existing chunks")?;
-            chunk_count = prior_chunks as u64;
-            doc_count = done.len() as u64;
-            table = Some(t);
+            prior_chunks = t.count_rows(None).await.context("counting existing chunks")? as u64;
+            resumed_table = Some(t);
             tracing::info!(
                 "resuming: {} documents ({prior_chunks} chunks) already indexed; skipping them",
                 done.len()
@@ -316,91 +306,48 @@ pub async fn build(
             tracing::info!("resume requested with no existing chunks; building the full-text index from scratch");
         }
     }
+    let prior_docs = done.len() as u64;
 
-    // Throttle progress logging to once per this many artifacts scanned.
-    const PROGRESS_EVERY: usize = 500;
+    // ---- Pipelined build: read+chunk → embed (concurrent) → write ----
+    //
+    // The three stages run concurrently, connected by bounded channels, so disk
+    // reads and LanceDB writes overlap GPU embedding instead of serializing with
+    // it. The reader emits chunks in document order; `buffered` preserves that
+    // order through the concurrent embed stage; the writer therefore sees chunks
+    // in document order and keeps durable writes aligned to document boundaries
+    // — the invariant `resume` depends on (a `doc_id` in the table is complete).
+    let concurrency = config.embed_concurrency.max(1);
+    let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<ChunkRow>>(concurrency * 2);
+    let (out_tx, out_rx) = mpsc::channel::<RecordBatch>(concurrency * 2);
 
-    for (scanned, (doc_id, name, media_type)) in artifacts.iter().enumerate() {
-        // Skip documents already fully indexed by a prior, interrupted build.
-        if done.contains(doc_id) {
-            continue;
-        }
+    // Reader: synchronous file I/O + chunking, on a blocking thread so it never
+    // stalls the async embed/write stages.
+    let reader = {
+        let cfg = config.clone();
+        tokio::task::spawn_blocking(move || run_reader(&cfg, artifacts, done, jobs_tx))
+    };
 
-        // Document boundary. Durable writes happen here and *only* here: a Lance
-        // fragment is flushed only when crossing into a new document, so it
-        // always ends on a complete document and never splits one mid-way. That
-        // invariant is what makes `resume` correct — a `doc_id` present in the
-        // table is guaranteed to have all of its chunks. To take the checkpoint
-        // we must first embed the just-finished document's tail (`pending`) so
-        // it lands in the buffer before the write.
-        if last_doc.as_deref() != Some(doc_id.as_str()) {
-            if buffer_bytes >= config.write_buffer_bytes {
-                flush_pending(&mut pending, &mut dim, embedder, &mut buffer, &mut buffer_bytes, &mut chunk_count)
-                    .await?;
-                write_buffer(&db, &mut table, &mut buffer).await?;
-                buffer_bytes = 0;
-            }
-            doc_count += 1;
-            last_doc = Some(doc_id.clone());
-        }
-        if scanned > 0 && scanned % PROGRESS_EVERY == 0 {
-            tracing::info!(
-                "embedding progress: {scanned}/{total_artifacts} artifacts, \
-                 {chunk_count} chunks embedded, {missing} files missing so far"
-            );
-        }
-        // u64::MAX / 2 reads the whole file without risking an offset overflow.
-        let loaded = read_artifact_text(config, name, media_type.as_deref(), 0, u64::MAX / 2);
-        match loaded.status {
-            ArtifactTextStatus::TextLoaded => {}
-            // A referenced file may legitimately be absent (e.g. redacted
-            // documents are pulled from disk), so a miss is not fatal — but it
-            // does leave the index partial, so count every one and warn on the
-            // first so a wrong artifact_root is still obvious. The end-of-build
-            // summary reports the total.
-            ArtifactTextStatus::ArtifactFileMissing => {
-                if missing == 0 {
-                    let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
-                    tracing::warn!(
-                        "artifact '{name}' (doc {doc_id}) not found at {}; \
-                         skipping it and any further missing files (e.g. redacted)",
-                        artifact_path(root, name).display(),
-                    );
-                }
-                missing += 1;
-                continue;
-            }
-            // Not a text type we read in v1 (the listing should already exclude
-            // these, but skip defensively rather than fail the whole build).
-            ArtifactTextStatus::UnsupportedArtifactType
-            | ArtifactTextStatus::ArtifactRootNotConfigured => continue,
-        }
-        let Some(body) = loaded.text else { continue };
-        for (idx, chunk) in chunk_text(&body, config.chunk_bytes, config.chunk_overlap)
-            .into_iter()
-            .enumerate()
-        {
-            pending.push(ChunkRow {
-                doc_id: doc_id.clone(),
-                chunk_idx: idx as i32,
-                artifact_name: name.clone(),
-                text: chunk,
-            });
-        }
-        // Embed in `EMBED_BATCH`-sized requests as chunks accumulate. This only
-        // grows the in-memory `buffer`; it never writes to LanceDB (that is the
-        // document-boundary checkpoint above), so `pending` may span documents
-        // for efficient batching without ever splitting a written fragment.
-        if pending.len() >= EMBED_BATCH {
-            flush_pending(&mut pending, &mut dim, embedder, &mut buffer, &mut buffer_bytes, &mut chunk_count)
-                .await?;
-        }
-    }
-    // Final document: embed its tail and persist whatever remains.
-    flush_pending(&mut pending, &mut dim, embedder, &mut buffer, &mut buffer_bytes, &mut chunk_count).await?;
-    if !buffer.is_empty() {
-        write_buffer(&db, &mut table, &mut buffer).await?;
-    }
+    // Embedder: keep `concurrency` embed requests in flight, results in order.
+    let embed_stage = {
+        let embedder = embedder.clone();
+        tokio::spawn(async move {
+            run_embedder(embedder, jobs_rx, out_tx, seed_dim, prior_chunks, concurrency).await
+        })
+    };
+
+    // Writer: drain embedded batches and flush complete documents to LanceDB.
+    // Runs inline so `build` ends up owning the resulting table handle. A writer
+    // failure drops `out_rx`, which unblocks the upstream stages (their sends
+    // fail and they wind down), so we can surface it before joining them.
+    let writer_db = db.clone();
+    let table = run_writer(&writer_db, resumed_table, out_rx, config.write_buffer_bytes)
+        .await
+        .context("writing chunk fragments")?;
+
+    let ReaderStats { docs: new_docs, missing } =
+        reader.await.context("reader task panicked")?;
+    let (dim, chunk_count) = embed_stage.await.context("embedder task panicked")??;
+    let doc_count = prior_docs + new_docs;
 
     if missing > 0 {
         let pct = 100.0 * missing as f64 / total_artifacts.max(1) as f64;
@@ -413,7 +360,7 @@ pub async fn build(
     let table = table.ok_or_else(|| {
         anyhow::anyhow!("no readable text artifacts found; nothing to index")
     })?;
-    let dim = dim.expect("dim is set whenever a batch was flushed");
+    let dim = dim.expect("dim is set whenever a batch was written");
 
     // Compact before indexing so the FTS/vector indexes build over a clean
     // fragment layout. With large write buffers there is usually little to do,
@@ -492,49 +439,252 @@ struct ChunkRow {
     text: String,
 }
 
-/// Embed `rows` and append them to the chunks table, creating it on first use.
-/// Embed a batch of chunk rows and assemble the Arrow [`RecordBatch`], tracking
-/// the embedding dimension. This does not touch LanceDB — the caller buffers
-/// the returned batches and flushes them with [`write_buffer`].
-async fn embed_rows(
-    dim: &mut Option<usize>,
-    embedder: &Embedder,
-    rows: &[ChunkRow],
-) -> Result<RecordBatch> {
+/// Tallies returned by the reader stage.
+struct ReaderStats {
+    /// New (non-skipped) documents whose artifacts were scanned.
+    docs: u64,
+    /// Referenced artifact files that were not on disk (skipped, not fatal).
+    missing: u64,
+}
+
+/// Reader stage: walk the (document-ordered) artifact list, read and chunk each
+/// readable text file, and send chunk rows downstream in `EMBED_BATCH`-sized
+/// jobs. Runs on a blocking thread (synchronous file I/O). Returns once the
+/// listing is exhausted or the downstream embed stage has gone away.
+fn run_reader(
+    config: &Config,
+    artifacts: Vec<(String, String, Option<String>)>,
+    done: HashSet<String>,
+    jobs_tx: mpsc::Sender<Vec<ChunkRow>>,
+) -> ReaderStats {
+    let total = artifacts.len();
+    let mut pending: Vec<ChunkRow> = Vec::new();
+    let mut docs = 0u64;
+    let mut missing = 0u64;
+    let mut last_doc: Option<&str> = None;
+    // Throttle progress logging to once per this many artifacts scanned.
+    const PROGRESS_EVERY: usize = 500;
+
+    for (scanned, (doc_id, name, media_type)) in artifacts.iter().enumerate() {
+        // Skip documents already fully indexed by a prior, interrupted build.
+        if done.contains(doc_id) {
+            continue;
+        }
+        if last_doc != Some(doc_id.as_str()) {
+            docs += 1;
+            last_doc = Some(doc_id);
+        }
+        if scanned > 0 && scanned % PROGRESS_EVERY == 0 {
+            tracing::info!(
+                "read progress: {scanned}/{total} artifacts scanned, {missing} files missing so far"
+            );
+        }
+        // u64::MAX / 2 reads the whole file without risking an offset overflow.
+        let loaded = read_artifact_text(config, name, media_type.as_deref(), 0, u64::MAX / 2);
+        match loaded.status {
+            ArtifactTextStatus::TextLoaded => {}
+            // A referenced file may legitimately be absent (e.g. redacted
+            // documents are pulled from disk), so a miss is not fatal — but it
+            // does leave the index partial, so count every one and warn on the
+            // first so a wrong artifact_root is still obvious. The end-of-build
+            // summary reports the total.
+            ArtifactTextStatus::ArtifactFileMissing => {
+                if missing == 0 {
+                    let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
+                    tracing::warn!(
+                        "artifact '{name}' (doc {doc_id}) not found at {}; \
+                         skipping it and any further missing files (e.g. redacted)",
+                        artifact_path(root, name).display(),
+                    );
+                }
+                missing += 1;
+                continue;
+            }
+            // Not a text type we read in v1 (the listing should already exclude
+            // these, but skip defensively rather than fail the whole build).
+            ArtifactTextStatus::UnsupportedArtifactType
+            | ArtifactTextStatus::ArtifactRootNotConfigured => continue,
+        }
+        let Some(body) = loaded.text else { continue };
+        for (idx, chunk) in chunk_text(&body, config.chunk_bytes, config.chunk_overlap)
+            .into_iter()
+            .enumerate()
+        {
+            pending.push(ChunkRow {
+                doc_id: doc_id.clone(),
+                chunk_idx: idx as i32,
+                artifact_name: name.clone(),
+                text: chunk,
+            });
+        }
+        // Hand off in `EMBED_BATCH`-sized jobs. Jobs may span documents — the
+        // writer realigns to document boundaries — so small documents still pack
+        // into full embed requests for GPU efficiency.
+        if pending.len() >= EMBED_BATCH
+            && jobs_tx.blocking_send(std::mem::take(&mut pending)).is_err()
+        {
+            // Embed stage went away (it errored); stop reading.
+            return ReaderStats { docs, missing };
+        }
+    }
+    if !pending.is_empty() {
+        let _ = jobs_tx.blocking_send(pending);
+    }
+    ReaderStats { docs, missing }
+}
+
+/// Embedder stage: embed jobs with up to `concurrency` Ollama requests in flight
+/// at once (via `buffered`, which preserves input order) and forward the
+/// resulting batches to the writer in document order. Returns the embedding
+/// dimension (seeded from a resume, else discovered) and the cumulative chunk
+/// count (prior chunks plus those embedded here).
+async fn run_embedder(
+    embedder: Embedder,
+    jobs_rx: mpsc::Receiver<Vec<ChunkRow>>,
+    out_tx: mpsc::Sender<RecordBatch>,
+    seed_dim: Option<usize>,
+    prior_chunks: u64,
+    concurrency: usize,
+) -> Result<(Option<usize>, u64)> {
+    // Adapt the channel into a Stream so `buffered` can drive N embeds at once.
+    let jobs = futures::stream::unfold(jobs_rx, |mut rx| async move {
+        rx.recv().await.map(|rows| (rows, rx))
+    });
+    let embedded = jobs
+        .map(|rows| {
+            let embedder = embedder.clone();
+            async move {
+                let n = rows.len();
+                let (batch, d) = embed_job(&embedder, &rows).await?;
+                Ok::<(RecordBatch, usize, usize), anyhow::Error>((batch, d, n))
+            }
+        })
+        .buffered(concurrency);
+    // `unfold` yields a `!Unpin` stream; pin it so `.next()` is callable.
+    futures::pin_mut!(embedded);
+
+    let mut dim = seed_dim;
+    let mut chunk_count = prior_chunks;
+    const PROGRESS_CHUNKS: u64 = 5000;
+    let mut next_log = prior_chunks + PROGRESS_CHUNKS;
+    while let Some(item) = embedded.next().await {
+        let (batch, d, n) = item?;
+        match dim {
+            Some(existing) if existing != d => {
+                bail!("embedding dimension changed from {existing} to {d} mid-build")
+            }
+            None => dim = Some(d),
+            _ => {}
+        }
+        chunk_count += n as u64;
+        if chunk_count >= next_log {
+            tracing::info!("embed progress: {chunk_count} chunks embedded");
+            next_log = chunk_count + PROGRESS_CHUNKS;
+        }
+        if out_tx.send(batch).await.is_err() {
+            // Writer stopped (it errored); its error is the real failure and the
+            // caller surfaces it, so just stop pulling.
+            break;
+        }
+    }
+    Ok((dim, chunk_count))
+}
+
+/// Embed one job of chunk rows into a [`RecordBatch`], returning the embedding
+/// dimension alongside it. Touches no shared state, so it is safe to run many
+/// of these concurrently.
+async fn embed_job(embedder: &Embedder, rows: &[ChunkRow]) -> Result<(RecordBatch, usize)> {
+    debug_assert!(!rows.is_empty(), "reader never sends an empty job");
     let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
     let vectors = embedder.embed(&texts).await?;
     let d = vectors[0].len();
-    match dim {
-        Some(existing) if *existing != d => {
-            bail!("embedding dimension changed from {existing} to {d} mid-build")
-        }
-        None => *dim = Some(d),
-        _ => {}
-    }
-    build_record_batch(rows, &vectors, d as i32)
+    let batch = build_record_batch(rows, &vectors, d as i32)?;
+    Ok((batch, d))
 }
 
-/// Embed the `pending` chunk rows (if any) and append the resulting batch to
-/// the in-memory `buffer`, updating the byte and chunk tallies and clearing
-/// `pending`. This never touches LanceDB — it only grows the buffer that the
-/// caller later flushes at a document boundary.
-async fn flush_pending(
-    pending: &mut Vec<ChunkRow>,
-    dim: &mut Option<usize>,
-    embedder: &Embedder,
-    buffer: &mut Vec<RecordBatch>,
-    buffer_bytes: &mut usize,
-    chunk_count: &mut u64,
-) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
+/// Writer stage: accumulate embedded batches (already in document order) and
+/// flush them to LanceDB. A flush writes every *complete* document and carries
+/// the still-open trailing document forward, so a durable fragment never splits
+/// a document — the invariant that makes `resume` correct. Returns the table
+/// handle (created on first write, or the resumed one).
+async fn run_writer(
+    db: &Connection,
+    mut table: Option<Table>,
+    mut out_rx: mpsc::Receiver<RecordBatch>,
+    threshold: usize,
+) -> Result<Option<Table>> {
+    let mut buffer: Vec<RecordBatch> = Vec::new();
+    let mut buffer_bytes: usize = 0;
+    while let Some(batch) = out_rx.recv().await {
+        buffer_bytes += batch.get_array_memory_size();
+        buffer.push(batch);
+        if buffer_bytes >= threshold {
+            let open = last_doc_id(&buffer)?;
+            let (mut flush, carry) = split_open_doc(std::mem::take(&mut buffer), &open)?;
+            write_buffer(db, &mut table, &mut flush).await?;
+            buffer_bytes = carry.iter().map(|b| b.get_array_memory_size()).sum();
+            buffer = carry;
+        }
     }
-    *chunk_count += pending.len() as u64;
-    let batch = embed_rows(dim, embedder, pending).await?;
-    pending.clear();
-    *buffer_bytes += batch.get_array_memory_size();
-    buffer.push(batch);
-    Ok(())
+    // Stream drained: the final document is complete, so persist the remainder.
+    if !buffer.is_empty() {
+        write_buffer(db, &mut table, &mut buffer).await?;
+    }
+    Ok(table)
+}
+
+/// The `doc_id` of the last row in the buffer — the document still open (more of
+/// its chunks may yet arrive), which a flush must carry rather than write.
+fn last_doc_id(buffer: &[RecordBatch]) -> Result<String> {
+    let last = buffer.last().expect("writer only splits a non-empty buffer");
+    let ids = str_col(last, "doc_id")?;
+    Ok(ids.value(last.num_rows() - 1).to_string())
+}
+
+/// Split document-ordered chunk batches into `(flush, carry)`: every batch up to
+/// the start of the trailing `open` document goes to `flush`; the open
+/// document's contiguous trailing run is carried forward. Because document ids
+/// are contiguous in the stream, the open document is always a suffix, so the
+/// carried run is exactly the rows a later flush (or the final drain) will
+/// complete.
+fn split_open_doc(
+    buffer: Vec<RecordBatch>,
+    open: &str,
+) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    // Global row index one past the last row that is *not* the open document; if
+    // the whole buffer is the open document, nothing can be flushed yet.
+    let mut last_non_open: Option<usize> = None;
+    let mut base = 0usize;
+    for b in &buffer {
+        let ids = str_col(b, "doc_id")?;
+        for r in 0..b.num_rows() {
+            if ids.value(r) != open {
+                last_non_open = Some(base + r);
+            }
+        }
+        base += b.num_rows();
+    }
+    let carry_start = last_non_open.map_or(0, |i| i + 1);
+
+    let mut flush = Vec::new();
+    let mut carry = Vec::new();
+    let mut base = 0usize;
+    for b in buffer {
+        let len = b.num_rows();
+        let (start, end) = (base, base + len);
+        if end <= carry_start {
+            flush.push(b);
+        } else if start >= carry_start {
+            carry.push(b);
+        } else {
+            // The boundary falls inside this batch (slices are zero-copy).
+            let cut = carry_start - start;
+            flush.push(b.slice(0, cut));
+            carry.push(b.slice(cut, len - cut));
+        }
+        base = end;
+    }
+    Ok((flush, carry))
 }
 
 /// Read the embedding dimension from an existing chunks table's schema, used to
@@ -858,5 +1008,66 @@ mod tests {
         let long = "x ".repeat(400);
         let s = snippet(&long);
         assert!(s.ends_with('…'));
+    }
+
+    /// Build a chunk batch from a list of `doc_id`s (one row each, dummy vector).
+    fn batch_of(doc_ids: &[&str]) -> RecordBatch {
+        let rows: Vec<ChunkRow> = doc_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| ChunkRow {
+                doc_id: (*id).to_string(),
+                chunk_idx: i as i32,
+                artifact_name: format!("{id}.ocr"),
+                text: format!("text-{i}"),
+            })
+            .collect();
+        let vectors: Vec<Vec<f32>> = rows.iter().map(|_| vec![0.0, 1.0]).collect();
+        build_record_batch(&rows, &vectors, 2).unwrap()
+    }
+
+    /// Flatten the `doc_id` column of a list of batches back into a `Vec`.
+    fn doc_ids(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let ids = str_col(b, "doc_id").unwrap();
+            for r in 0..b.num_rows() {
+                out.push(ids.value(r).to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn split_carries_open_doc_across_batches() {
+        // Open doc "C" spans the batch boundary; everything before it flushes.
+        let buffer = vec![batch_of(&["A", "A", "B"]), batch_of(&["B", "C", "C"])];
+        let open = last_doc_id(&buffer).unwrap();
+        assert_eq!(open, "C");
+        let (flush, carry) = split_open_doc(buffer, &open).unwrap();
+        assert_eq!(doc_ids(&flush), ["A", "A", "B", "B"]);
+        assert_eq!(doc_ids(&carry), ["C", "C"]);
+    }
+
+    #[test]
+    fn split_carries_everything_when_buffer_is_one_open_doc() {
+        // A single document larger than the buffer cannot be checkpointed yet:
+        // nothing is flushed (which would split it) and all rows carry forward.
+        let buffer = vec![batch_of(&["C", "C"]), batch_of(&["C"])];
+        let open = last_doc_id(&buffer).unwrap();
+        let (flush, carry) = split_open_doc(buffer, &open).unwrap();
+        assert!(flush.is_empty());
+        assert_eq!(doc_ids(&carry), ["C", "C", "C"]);
+    }
+
+    #[test]
+    fn split_flushes_all_when_boundary_aligns() {
+        // The open doc occupies exactly the final batch: earlier batches flush
+        // whole, the last carries whole, no slicing.
+        let buffer = vec![batch_of(&["A", "A"]), batch_of(&["B", "B"])];
+        let open = last_doc_id(&buffer).unwrap();
+        let (flush, carry) = split_open_doc(buffer, &open).unwrap();
+        assert_eq!(doc_ids(&flush), ["A", "A"]);
+        assert_eq!(doc_ids(&carry), ["B", "B"]);
     }
 }

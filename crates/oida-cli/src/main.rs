@@ -70,6 +70,10 @@ struct Args {
     #[arg(long, env = "OIDA_INGEST_BUFFER_BYTES")]
     ingest_buffer_bytes: Option<usize>,
 
+    /// Concurrent embed requests in flight during a full-text build (overrides config).
+    #[arg(long, env = "OIDA_EMBED_CONCURRENCY")]
+    embed_concurrency: Option<usize>,
+
     /// Path to the oida-mcp-server binary (defaults to a sibling of this exe).
     #[arg(long, env = "OIDA_SERVER_BIN")]
     server_bin: Option<PathBuf>,
@@ -143,6 +147,9 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     }
     if let Some(v) = args.ingest_buffer_bytes {
         config.ingest_buffer_bytes = v;
+    }
+    if let Some(v) = args.embed_concurrency {
+        config.embed_concurrency = v;
     }
 }
 
