@@ -3,8 +3,9 @@
 //! The metadata index ([`crate::Index`]) answers questions about a document's
 //! fields. This module answers questions about what a document *says*: it reads
 //! the plain-text (OCR) artifacts, splits them into overlapping chunks, embeds
-//! each chunk with an Ollama model, and stores both the text and its vector in
-//! a single LanceDB table. Queries then run a full-text search and a vector
+//! each chunk with an OpenAI-compatible model (Ollama or vLLM), and stores both
+//! the text and its vector in a single LanceDB table. Queries then run a
+//! full-text search and a vector
 //! search in parallel and fuse the two rankings with Reciprocal Rank Fusion
 //! (RRF), collapsing chunk hits back to their parent document.
 //!
@@ -12,11 +13,12 @@
 //!
 //! A vector index is only meaningful when queries are embedded with the *same*
 //! model that produced the stored vectors. To guarantee that, the build writes
-//! a `_meta` row recording the embed model name, its vector dimension, and the
-//! model's content digest. At query time we read that row back and embed the
-//! query with the *stored* model name (never the live config), assert the
-//! dimension matches, and verify the model's current digest still equals the
-//! stored one — refusing to serve stale results if the model changed under us.
+//! a `_meta` row recording the embed model name and its vector dimension. At
+//! query time we embed with the *stored* model name (never the live config),
+//! assert the dimension matches, and — unless verification is disabled — refuse
+//! to serve when the configured model name disagrees with the stored one. There
+//! is no portable content digest across embed servers, so the model name is the
+//! pin: encode any weights change (a commit hash, a quantization tag) into it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
@@ -334,6 +336,7 @@ pub async fn build(
     // in document order and keeps durable writes aligned to document boundaries
     // — the invariant `resume` depends on (a `doc_id` in the table is complete).
     let concurrency = config.embed_concurrency.max(1);
+    let read_concurrency = config.read_concurrency.max(1);
     let embed_batch = config.embed_batch.max(1);
     let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<ChunkRow>>(concurrency * 2);
     let (out_tx, out_rx) = mpsc::channel::<RecordBatch>(concurrency * 2);
@@ -349,13 +352,16 @@ pub async fn build(
         tokio::spawn(run_ticker(progress, total_artifacts as u64, stop_rx))
     };
 
-    // Reader: synchronous file I/O + chunking, on a blocking thread so it never
-    // stalls the async embed/write stages.
+    // Reader: read + chunk up to `read_concurrency` files at once (each on the
+    // blocking pool), emitting chunks in document order. Concurrent reads keep a
+    // fast embed backend fed when per-file storage latency would otherwise starve
+    // a single serial reader.
     let reader = {
         let cfg = config.clone();
         let progress = progress.clone();
-        tokio::task::spawn_blocking(move || {
-            run_reader(&cfg, artifacts, done, embed_batch, &progress, jobs_tx)
+        tokio::spawn(async move {
+            run_reader(&cfg, artifacts, done, embed_batch, read_concurrency, &progress, jobs_tx)
+                .await
         })
     };
 
@@ -482,88 +488,145 @@ struct ReaderStats {
     missing: u64,
 }
 
-/// Reader stage: walk the (document-ordered) artifact list, read and chunk each
-/// readable text file, and send chunk rows downstream in `EMBED_BATCH`-sized
-/// jobs. Runs on a blocking thread (synchronous file I/O). Returns once the
-/// listing is exhausted or the downstream embed stage has gone away.
-fn run_reader(
+/// Outcome of reading + chunking one artifact, produced on the blocking pool and
+/// consumed in document order by the reader's sequencing loop.
+enum ReadOutcome {
+    /// Chunk rows for one artifact (empty if the text was blank).
+    Chunks(Vec<ChunkRow>),
+    /// The referenced file was not on disk (skipped, not fatal).
+    Missing { doc_id: String, name: String },
+    /// Not a text artifact we read, or no text extracted; nothing to do.
+    Empty,
+}
+
+/// Read and chunk one artifact. Pure blocking file I/O plus CPU chunking, so it
+/// is safe — and the point — to run many of these at once on the blocking pool.
+fn read_one(config: &Config, doc_id: &str, name: &str, media_type: Option<&str>) -> ReadOutcome {
+    // u64::MAX / 2 reads the whole file without risking an offset overflow.
+    let loaded = read_artifact_text(config, name, media_type, 0, u64::MAX / 2);
+    match loaded.status {
+        ArtifactTextStatus::TextLoaded => {}
+        // A referenced file may legitimately be absent (e.g. redacted documents
+        // are pulled from disk), so a miss is not fatal; the caller counts it.
+        ArtifactTextStatus::ArtifactFileMissing => {
+            return ReadOutcome::Missing { doc_id: doc_id.to_string(), name: name.to_string() };
+        }
+        // Not a text type we read in v1 (the listing should already exclude
+        // these, but skip defensively rather than fail the whole build).
+        ArtifactTextStatus::UnsupportedArtifactType
+        | ArtifactTextStatus::ArtifactRootNotConfigured => return ReadOutcome::Empty,
+    }
+    let Some(body) = loaded.text else { return ReadOutcome::Empty };
+    let rows = chunk_text(&body, config.chunk_bytes, config.chunk_overlap)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chunk)| ChunkRow {
+            doc_id: doc_id.to_string(),
+            chunk_idx: idx as i32,
+            artifact_name: name.to_string(),
+            text: chunk,
+        })
+        .collect();
+    ReadOutcome::Chunks(rows)
+}
+
+/// Reader stage: read and chunk the (document-ordered) artifacts with up to
+/// `read_concurrency` files in flight on the blocking pool, sending chunk rows
+/// downstream in `embed_batch`-sized jobs. `buffered` preserves document order,
+/// so the writer still sees whole documents in order — the invariant `resume`
+/// depends on. Returns once the listing is exhausted or the embed stage has gone
+/// away.
+async fn run_reader(
     config: &Config,
     artifacts: Vec<(String, String, Option<String>)>,
     done: HashSet<String>,
     embed_batch: usize,
+    read_concurrency: usize,
     progress: &Progress,
     jobs_tx: mpsc::Sender<Vec<ChunkRow>>,
 ) -> ReaderStats {
-    let mut pending: Vec<ChunkRow> = Vec::new();
+    // Sequential pre-pass: drop documents a prior build already indexed and count
+    // distinct (non-skipped) documents. This is cheap (no I/O), so it does not
+    // hold up the concurrent reads that follow.
+    let mut to_read: Vec<(String, String, Option<String>)> = Vec::with_capacity(artifacts.len());
     let mut docs = 0u64;
-    let mut missing = 0u64;
     let mut last_doc: Option<&str> = None;
-
     for (doc_id, name, media_type) in artifacts.iter() {
-        progress.scanned.fetch_add(1, Ordering::Relaxed);
-        // Skip documents already fully indexed by a prior, interrupted build.
         if done.contains(doc_id) {
+            progress.scanned.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         if last_doc != Some(doc_id.as_str()) {
             docs += 1;
             last_doc = Some(doc_id);
         }
-        // u64::MAX / 2 reads the whole file without risking an offset overflow.
-        let loaded = read_artifact_text(config, name, media_type.as_deref(), 0, u64::MAX / 2);
-        match loaded.status {
-            ArtifactTextStatus::TextLoaded => {}
-            // A referenced file may legitimately be absent (e.g. redacted
-            // documents are pulled from disk), so a miss is not fatal — but it
-            // does leave the index partial, so count every one and warn on the
-            // first so a wrong artifact_root is still obvious. The end-of-build
-            // summary reports the total.
-            ArtifactTextStatus::ArtifactFileMissing => {
+        to_read.push((doc_id.clone(), name.clone(), media_type.clone()));
+    }
+
+    // Share the config into the per-file blocking reads without recloning it.
+    let cfg = Arc::new(config.clone());
+    let reads = futures::stream::iter(to_read)
+        .map(|(doc_id, name, media_type)| {
+            let cfg = cfg.clone();
+            async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    read_one(&cfg, &doc_id, &name, media_type.as_deref())
+                })
+                .await;
+                progress.scanned.fetch_add(1, Ordering::Relaxed);
+                outcome
+            }
+        })
+        .buffered(read_concurrency);
+    futures::pin_mut!(reads);
+
+    let mut pending: Vec<ChunkRow> = Vec::new();
+    let mut missing = 0u64;
+    while let Some(joined) = reads.next().await {
+        let outcome = match joined {
+            Ok(o) => o,
+            // A read task panicked — log and skip that artifact rather than abort
+            // the whole build over one file.
+            Err(e) => {
+                tracing::error!("artifact read task panicked: {e}");
+                continue;
+            }
+        };
+        match outcome {
+            ReadOutcome::Chunks(rows) => pending.extend(rows),
+            // Warn on the first miss so a wrong artifact_root is obvious; the
+            // end-of-build summary reports the total.
+            ReadOutcome::Missing { doc_id, name } => {
                 if missing == 0 {
                     let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
                     tracing::warn!(
                         "artifact '{name}' (doc {doc_id}) not found at {}; \
                          skipping it and any further missing files (e.g. redacted)",
-                        artifact_path(root, name).display(),
+                        artifact_path(root, &name).display(),
                     );
                 }
                 missing += 1;
                 progress.missing.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            // Not a text type we read in v1 (the listing should already exclude
-            // these, but skip defensively rather than fail the whole build).
-            ArtifactTextStatus::UnsupportedArtifactType
-            | ArtifactTextStatus::ArtifactRootNotConfigured => continue,
-        }
-        let Some(body) = loaded.text else { continue };
-        for (idx, chunk) in chunk_text(&body, config.chunk_bytes, config.chunk_overlap)
-            .into_iter()
-            .enumerate()
-        {
-            pending.push(ChunkRow {
-                doc_id: doc_id.clone(),
-                chunk_idx: idx as i32,
-                artifact_name: name.clone(),
-                text: chunk,
-            });
+            ReadOutcome::Empty => continue,
         }
         // Hand off in `embed_batch`-sized jobs. Drain whole batches in a loop
-        // rather than shipping the leftover `pending` in one shot: a single
-        // large artifact can chunk into thousands of rows, and sending them as
-        // one embed request crashes the Ollama runner. Jobs may span documents —
-        // the writer realigns to document boundaries — so small documents still
-        // pack into full embed requests for GPU efficiency.
+        // rather than shipping the leftover `pending` in one shot: a single large
+        // artifact can chunk into thousands of rows, and sending them as one
+        // embed request crashes the model runner. Jobs may span documents — the
+        // writer realigns to document boundaries — so small documents still pack
+        // into full embed requests for backend efficiency.
         while pending.len() >= embed_batch {
             let job: Vec<ChunkRow> = pending.drain(..embed_batch).collect();
-            if jobs_tx.blocking_send(job).is_err() {
+            if jobs_tx.send(job).await.is_err() {
                 // Embed stage went away (it errored); stop reading.
                 return ReaderStats { docs, missing };
             }
         }
     }
     if !pending.is_empty() {
-        let _ = jobs_tx.blocking_send(pending);
+        let _ = jobs_tx.send(pending).await;
     }
     ReaderStats { docs, missing }
 }

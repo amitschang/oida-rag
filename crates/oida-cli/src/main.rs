@@ -84,6 +84,10 @@ struct Args {
     #[arg(long, env = "OIDA_EMBED_CONCURRENCY")]
     embed_concurrency: Option<usize>,
 
+    /// Concurrent artifact-file reads during a full-text build (overrides config).
+    #[arg(long, env = "OIDA_READ_CONCURRENCY")]
+    read_concurrency: Option<usize>,
+
     /// Text chunks per embed request during a full-text build (overrides config).
     #[arg(long, env = "OIDA_EMBED_BATCH")]
     embed_batch: Option<usize>,
@@ -175,6 +179,9 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     }
     if let Some(v) = args.embed_concurrency {
         config.embed_concurrency = v;
+    }
+    if let Some(v) = args.read_concurrency {
+        config.read_concurrency = v;
     }
     if let Some(v) = args.embed_batch {
         config.embed_batch = v;

@@ -43,6 +43,13 @@ pub const DEFAULT_INGEST_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 /// across request round-trips. To benefit, the Ollama server must allow at
 /// least this many parallel requests (`OLLAMA_NUM_PARALLEL`).
 pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
+/// Default number of artifact files read and chunked concurrently while building
+/// the hybrid index. The reader hands chunks to the embed stage; with a fast
+/// embed backend (e.g. vLLM) a single serial reader becomes the bottleneck, so
+/// several reads overlap to keep storage (which itself handles concurrency, like
+/// Ceph) busy and the embed connections saturated. Defaults higher than embed
+/// concurrency because per-file read latency, not bandwidth, is the limiter.
+pub const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// Default number of text chunks sent per Ollama embed request. Larger batches
 /// amortize per-request overhead (HTTP, tokenization setup, JSON float encoding)
 /// across more chunks, which matters because a small embed model is usually
@@ -107,6 +114,10 @@ pub struct Config {
     /// hybrid index, overlapping Ollama round-trips to keep the GPU saturated.
     /// Requires a matching `OLLAMA_NUM_PARALLEL` on the server to take effect.
     pub embed_concurrency: usize,
+    /// Number of artifact files read and chunked concurrently while building the
+    /// hybrid index, overlapping per-file storage latency so the reader can keep
+    /// a fast embed backend fed.
+    pub read_concurrency: usize,
     /// Number of text chunks per Ollama embed request during a hybrid build.
     /// Larger amortizes per-request overhead; keep below what the model runner's
     /// context can hold for one request.
@@ -134,6 +145,7 @@ impl Default for Config {
             compact_on_build: DEFAULT_COMPACT_ON_BUILD,
             ingest_buffer_bytes: DEFAULT_INGEST_BUFFER_BYTES,
             embed_concurrency: DEFAULT_EMBED_CONCURRENCY,
+            read_concurrency: DEFAULT_READ_CONCURRENCY,
             embed_batch: DEFAULT_EMBED_BATCH,
             embed_verify_model: DEFAULT_EMBED_VERIFY_MODEL,
         }
