@@ -91,10 +91,8 @@ pub struct IndexStats {
     pub chunks: u64,
     /// Embedding vector dimension.
     pub dim: usize,
-    /// Ollama model used to produce the embeddings.
+    /// Model used to produce the embeddings.
     pub embed_model: String,
-    /// Content digest of the embed model at build time.
-    pub model_digest: String,
     /// Unix seconds when the index was built.
     pub built_at: i64,
     /// Chunk size (bytes) used when splitting text.
@@ -108,7 +106,6 @@ pub struct IndexStats {
 struct Meta {
     embed_model: String,
     dim: usize,
-    model_digest: String,
     built_at: i64,
     chunk_bytes: usize,
     chunk_overlap: usize,
@@ -121,6 +118,12 @@ pub struct HybridIndex {
     table: Table,
     embedder: Embedder,
     meta: Meta,
+    /// The embed model the caller configured; compared against `meta.embed_model`
+    /// at query time when `verify_model` is set.
+    configured_model: String,
+    /// Whether to refuse a query when `configured_model` disagrees with the
+    /// model recorded in the index.
+    verify_model: bool,
 }
 
 impl HybridIndex {
@@ -144,12 +147,17 @@ impl HybridIndex {
             .execute()
             .await
             .context("opening chunks table")?;
-        let embedder =
-            Embedder::new(&config.ollama_host, meta.embed_model.clone(), config.embed_num_ctx)?;
+        let embedder = Embedder::new(
+            &config.embed_host,
+            meta.embed_model.clone(),
+            config.embed_api_key.clone(),
+        )?;
         Ok(Self {
             table,
             embedder,
             meta,
+            configured_model: config.embed_model.clone(),
+            verify_model: config.embed_verify_model,
         })
     }
 
@@ -161,7 +169,6 @@ impl HybridIndex {
             chunks,
             dim: self.meta.dim,
             embed_model: self.meta.embed_model.clone(),
-            model_digest: self.meta.model_digest.clone(),
             built_at: self.meta.built_at,
             chunk_bytes: self.meta.chunk_bytes,
             chunk_overlap: self.meta.chunk_overlap,
@@ -171,28 +178,26 @@ impl HybridIndex {
     /// Run a hybrid keyword + semantic search, returning up to `limit`
     /// documents ranked by fused relevance.
     ///
-    /// Guards against a silently changed embedding model: the query is embedded
-    /// with the stored model name, its dimension is checked against the stored
-    /// dimension, and the model's live digest is compared with the stored one.
+    /// Guards against querying with a model that disagrees with the stored
+    /// vectors: unless verification is disabled, the configured model name must
+    /// match the one recorded in the index (pinning is by name alone), and the
+    /// query embedding's dimension is checked against the stored dimension.
     pub async fn query(&self, text: &str, limit: usize) -> Result<Vec<HybridChunkHit>> {
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
         let limit = limit.max(1);
 
-        // Refuse to serve if the model changed out from under the index.
-        let live_digest = self
-            .embedder
-            .digest()
-            .await
-            .context("verifying embed model digest")?;
-        if live_digest != self.meta.model_digest {
+        // Refuse to serve if the configured model name differs from the one the
+        // index was built with. Names are the pin, so encode any weights change
+        // into the name; bypass with `embed_verify_model = false` when intended.
+        if self.verify_model && self.configured_model != self.meta.embed_model {
             bail!(
-                "embed model '{}' has changed (digest {} != index digest {}); \
-                 rebuild the index (oida-cli ingest --full-text --force)",
-                self.meta.embed_model,
-                live_digest,
-                self.meta.model_digest
+                "configured embed model '{}' does not match index model '{}'; \
+                 rebuild the index (oida-cli ingest --full-text --force) or set \
+                 embed_verify_model = false to override",
+                self.configured_model,
+                self.meta.embed_model
             );
         }
 
@@ -275,10 +280,6 @@ pub async fn build(
             }
         }
     }
-
-    // Resolve the model digest up front; this also fails fast if the model is
-    // not installed before we do any expensive work.
-    let model_digest = embedder.digest().await.context("reading embed model digest")?;
 
     let artifacts = index.text_artifacts().await.context("listing text artifacts")?;
     let total_artifacts = artifacts.len();
@@ -446,7 +447,6 @@ pub async fn build(
     let meta = Meta {
         embed_model: embedder.model().to_string(),
         dim,
-        model_digest,
         built_at,
         chunk_bytes: config.chunk_bytes,
         chunk_overlap: config.chunk_overlap,
@@ -460,7 +460,6 @@ pub async fn build(
         chunks: meta.chunks,
         dim: meta.dim,
         embed_model: meta.embed_model,
-        model_digest: meta.model_digest,
         built_at: meta.built_at,
         chunk_bytes: meta.chunk_bytes,
         chunk_overlap: meta.chunk_overlap,
@@ -1021,7 +1020,6 @@ async fn write_meta(db: &Connection, meta: &Meta) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("embed_model", DataType::Utf8, false),
         Field::new("dim", DataType::Int32, false),
-        Field::new("model_digest", DataType::Utf8, false),
         Field::new("built_at", DataType::Int64, false),
         Field::new("chunk_bytes", DataType::Int32, false),
         Field::new("chunk_overlap", DataType::Int32, false),
@@ -1033,7 +1031,6 @@ async fn write_meta(db: &Connection, meta: &Meta) -> Result<()> {
         vec![
             Arc::new(StringArray::from(vec![meta.embed_model.clone()])),
             Arc::new(Int32Array::from(vec![meta.dim as i32])),
-            Arc::new(StringArray::from(vec![meta.model_digest.clone()])),
             Arc::new(Int64Array::from(vec![meta.built_at])),
             Arc::new(Int32Array::from(vec![meta.chunk_bytes as i32])),
             Arc::new(Int32Array::from(vec![meta.chunk_overlap as i32])),
@@ -1071,7 +1068,6 @@ async fn read_meta(db: &Connection) -> Result<Meta> {
         .ok_or_else(|| anyhow::anyhow!("hybrid index {META_TABLE} table is empty; rebuild it"))?;
 
     let embed_model = str_col(&batch, "embed_model")?.value(0).to_string();
-    let model_digest = str_col(&batch, "model_digest")?.value(0).to_string();
     let dim = i32_col(&batch, "dim")?.value(0) as usize;
     let chunk_bytes = i32_col(&batch, "chunk_bytes")?.value(0) as usize;
     let chunk_overlap = i32_col(&batch, "chunk_overlap")?.value(0) as usize;
@@ -1082,7 +1078,6 @@ async fn read_meta(db: &Connection) -> Result<Meta> {
     Ok(Meta {
         embed_model,
         dim,
-        model_digest,
         built_at,
         chunk_bytes,
         chunk_overlap,

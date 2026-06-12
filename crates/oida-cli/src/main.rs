@@ -38,9 +38,19 @@ struct Args {
     #[arg(long, env = "OIDA_MODEL")]
     model: Option<String>,
 
-    /// Ollama host URL (overrides config).
+    /// Ollama host URL for the chat agent (overrides config).
     #[arg(long, env = "OIDA_OLLAMA_HOST")]
     ollama_host: Option<String>,
+
+    /// OpenAI-compatible host URL for embeddings, e.g. a vLLM sidecar at
+    /// `http://localhost:8000` (overrides config).
+    #[arg(long, env = "OIDA_EMBED_HOST")]
+    embed_host: Option<String>,
+
+    /// Bearer token sent with embed requests, for a server started with an API
+    /// key (overrides config).
+    #[arg(long, env = "OIDA_EMBED_API_KEY")]
+    embed_api_key: Option<String>,
 
     /// Directory containing artifact files on disk (overrides config).
     #[arg(long, env = "OIDA_ARTIFACT_ROOT")]
@@ -78,10 +88,10 @@ struct Args {
     #[arg(long, env = "OIDA_EMBED_BATCH")]
     embed_batch: Option<usize>,
 
-    /// Context window (tokens) sent as `num_ctx` on embed requests; 0 omits it
-    /// and uses the model/server default (overrides config).
-    #[arg(long, env = "OIDA_EMBED_NUM_CTX")]
-    embed_num_ctx: Option<usize>,
+    /// Verify the configured embed model name matches the index's at query time
+    /// (overrides config). Pass `--embed-verify-model false` to bypass.
+    #[arg(long, env = "OIDA_EMBED_VERIFY_MODEL")]
+    embed_verify_model: Option<bool>,
 
     /// Path to the oida-mcp-server binary (defaults to a sibling of this exe).
     #[arg(long, env = "OIDA_SERVER_BIN")]
@@ -136,6 +146,12 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     if let Some(h) = &args.ollama_host {
         config.ollama_host = h.clone();
     }
+    if let Some(h) = &args.embed_host {
+        config.embed_host = h.clone();
+    }
+    if let Some(k) = &args.embed_api_key {
+        config.embed_api_key = Some(k.clone());
+    }
     if let Some(r) = &args.artifact_root {
         config.artifact_root = Some(r.clone());
     }
@@ -163,9 +179,8 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     if let Some(v) = args.embed_batch {
         config.embed_batch = v;
     }
-    if let Some(v) = args.embed_num_ctx {
-        // 0 is the escape hatch for "omit num_ctx and defer to the model default".
-        config.embed_num_ctx = (v > 0).then_some(v);
+    if let Some(v) = args.embed_verify_model {
+        config.embed_verify_model = v;
     }
 }
 
@@ -258,7 +273,7 @@ async fn run_ingest(
             .context("opening index to resume (run a metadata ingest first)")?;
         let model = &config.embed_model;
         let embedder =
-            Embedder::new(&config.ollama_host, model.to_string(), config.embed_num_ctx)?;
+            Embedder::new(&config.embed_host, model.to_string(), config.embed_api_key.clone())?;
         eprintln!("Resuming hybrid text index build with embed model '{model}'…");
         let hstats = hybrid::build(config, &index, &embedder, false, true).await?;
         eprintln!(
@@ -281,7 +296,7 @@ async fn run_ingest(
         let index = Index::open(config).await.context("opening index")?;
         let model = &config.embed_model;
         let embedder =
-            Embedder::new(&config.ollama_host, model.to_string(), config.embed_num_ctx)?;
+            Embedder::new(&config.embed_host, model.to_string(), config.embed_api_key.clone())?;
         eprintln!("Building hybrid text index with embed model '{model}'…");
         let hstats = hybrid::build(config, &index, &embedder, force, false).await?;
         eprintln!(
@@ -307,7 +322,6 @@ async fn run_stats(config: &Config) -> anyhow::Result<()> {
             println!("    chunks:       {}", s.chunks);
             println!("    embed model:  {}", s.embed_model);
             println!("    vector dim:   {}", s.dim);
-            println!("    model digest: {}", s.model_digest);
             println!("    chunk bytes:  {}", s.chunk_bytes);
             println!("    chunk overlap:{}", s.chunk_overlap);
             println!("    built at:     {} (unix)", s.built_at);

@@ -6,8 +6,12 @@ use serde::{Deserialize, Serialize};
 
 /// Default Ollama model used to drive tool calling.
 pub const DEFAULT_MODEL: &str = "qwen2.5-coder:latest";
-/// Default Ollama HTTP endpoint.
+/// Default Ollama HTTP endpoint (used for the chat agent).
 pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
+/// Default OpenAI-compatible endpoint used for embeddings. Defaults to the same
+/// host as the chat agent (Ollama serves `/v1/embeddings` out of the box); point
+/// it at a vLLM sidecar (e.g. `http://localhost:8000`) for higher throughput.
+pub const DEFAULT_EMBED_HOST: &str = "http://localhost:11434";
 /// Default path to the OIDA parquet index (one row per document, artifacts
 /// inline as a `list<struct>` column).
 pub const DEFAULT_PARQUET: &str = "oida-index.parquet";
@@ -45,12 +49,11 @@ pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
 /// overhead-bound rather than GPU-bound. Too large can overflow the model
 /// runner's context, so it is bounded and tunable.
 pub const DEFAULT_EMBED_BATCH: usize = 64;
-/// Default context window (tokens) sent as `options.num_ctx` on embed requests.
-/// `nomic-embed-text` supports up to 8192; Ollama otherwise defaults to 2048,
-/// which a dense chunk can tokenize past, crashing the model runner. Since a
-/// chunk is bounded to `DEFAULT_CHUNK_BYTES` bytes (≤ that many tokens), 8192
-/// leaves ample headroom so no chunk can overflow the context.
-pub const DEFAULT_EMBED_NUM_CTX: Option<usize> = Some(8192);
+/// Whether, by default, a query verifies that the configured embed model name
+/// matches the one recorded in the index. Pinning is by name alone (no portable
+/// content digest across servers), so set the name to encode a weights identity
+/// — a commit hash, a quantization tag, a `num_ctx` variant — and keep this on.
+pub const DEFAULT_EMBED_VERIFY_MODEL: bool = true;
 
 /// Runtime configuration.
 ///
@@ -66,8 +69,14 @@ pub struct Config {
     ///
     /// Optional: when unset, artifact-text tools degrade gracefully.
     pub artifact_root: Option<PathBuf>,
-    /// Base URL of the Ollama server.
+    /// Base URL of the Ollama server (the chat agent).
     pub ollama_host: String,
+    /// Base URL of the OpenAI-compatible server used for embeddings. Kept
+    /// separate from `ollama_host` so embeddings can be served by a faster
+    /// sidecar (e.g. vLLM) while chat stays on Ollama.
+    pub embed_host: String,
+    /// Optional bearer token sent with embed requests (vLLM `--api-key`).
+    pub embed_api_key: Option<String>,
     /// Ollama model name used by the CLI agent.
     pub ollama_model: String,
     /// Path to the LanceDB database holding the hybrid keyword+vector index
@@ -102,11 +111,10 @@ pub struct Config {
     /// Larger amortizes per-request overhead; keep below what the model runner's
     /// context can hold for one request.
     pub embed_batch: usize,
-    /// Context window, in tokens, sent as `options.num_ctx` on every embed
-    /// request, or `None` to omit it and use the model/server default (2048 in
-    /// Ollama). Set above the worst-case chunk's token count to keep a long
-    /// input from overflowing the runner's context and crashing it.
-    pub embed_num_ctx: Option<usize>,
+    /// Verify, before serving a query, that `embed_model` matches the model
+    /// name recorded in the index. Pinning is by name only; turn this off to
+    /// bypass the check (e.g. when intentionally serving with a renamed model).
+    pub embed_verify_model: bool,
 }
 
 impl Default for Config {
@@ -115,6 +123,8 @@ impl Default for Config {
             parquet_path: PathBuf::from(DEFAULT_PARQUET),
             artifact_root: None,
             ollama_host: DEFAULT_OLLAMA_HOST.to_string(),
+            embed_host: DEFAULT_EMBED_HOST.to_string(),
+            embed_api_key: None,
             ollama_model: DEFAULT_MODEL.to_string(),
             lance_path: PathBuf::from(DEFAULT_LANCE),
             embed_model: DEFAULT_EMBED_MODEL.to_string(),
@@ -125,7 +135,7 @@ impl Default for Config {
             ingest_buffer_bytes: DEFAULT_INGEST_BUFFER_BYTES,
             embed_concurrency: DEFAULT_EMBED_CONCURRENCY,
             embed_batch: DEFAULT_EMBED_BATCH,
-            embed_num_ctx: DEFAULT_EMBED_NUM_CTX,
+            embed_verify_model: DEFAULT_EMBED_VERIFY_MODEL,
         }
     }
 }
