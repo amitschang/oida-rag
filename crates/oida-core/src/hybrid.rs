@@ -405,6 +405,30 @@ pub async fn build(
     })?;
     let dim = dim.expect("dim is set whenever a batch was written");
 
+    // Write `_meta` now, before the (optional, slow) compaction and index builds.
+    // Every value it records is already final and durable: the chunks are on
+    // disk, `dim`/`chunk_count`/`doc_count` are known, and compaction/indexing
+    // only change physical layout, never these numbers. Writing it here is what
+    // makes the index openable — `HybridIndex::open` requires `_meta` — so an
+    // interruption during compaction or the vector-index build leaves a fully
+    // queryable index (vector search falls back to a flat scan) rather than one
+    // the server refuses to load. `_meta` is a single tiny row, so deferring it
+    // this far costs no memory.
+    let built_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let meta = Meta {
+        embed_model: embedder.model().to_string(),
+        dim,
+        built_at,
+        chunk_bytes: config.chunk_bytes,
+        chunk_overlap: config.chunk_overlap,
+        documents: doc_count,
+        chunks: chunk_count,
+    };
+    write_meta(&db, &meta).await?;
+
     // Compact before indexing so the FTS/vector indexes build over a clean
     // fragment layout. With large write buffers there is usually little to do,
     // but this keeps the result insensitive to how the row counts fell.
@@ -445,21 +469,6 @@ pub async fn build(
     } else {
         tracing::info!("skipping vector index ({chunk_count} chunks < {MIN_VECTOR_INDEX_ROWS})");
     }
-
-    let built_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let meta = Meta {
-        embed_model: embedder.model().to_string(),
-        dim,
-        built_at,
-        chunk_bytes: config.chunk_bytes,
-        chunk_overlap: config.chunk_overlap,
-        documents: doc_count,
-        chunks: chunk_count,
-    };
-    write_meta(&db, &meta).await?;
 
     Ok(IndexStats {
         documents: meta.documents,
