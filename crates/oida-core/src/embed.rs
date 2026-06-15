@@ -10,32 +10,102 @@
 //! is to encode a weights identity (a commit hash, a quantization tag, a
 //! `num_ctx` variant) into the model name itself and let the name be the pin.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// A reusable embedding client bound to a base URL.
+/// One embedding backend: a base URL and its live in-flight request count, used
+/// to balance load across replicas by fewest connections.
+#[derive(Debug)]
+struct Backend {
+    base: String,
+    /// Embed requests currently in flight to this backend (the least-connections
+    /// signal). Shared across [`Embedder`] clones via the `Arc` on `backends`.
+    inflight: AtomicUsize,
+}
+
+/// A reusable embedding client over one or more interchangeable backends.
+///
+/// With multiple backends (replicas of the same model served behind separate
+/// addresses), each request is routed to the backend with the fewest in-flight
+/// requests — client-side least-connections balancing, so no external load
+/// balancer is needed and a slow replica naturally receives less work. A single
+/// backend (the common case: Ollama, or the query path) skips the bookkeeping.
 #[derive(Clone, Debug)]
 pub struct Embedder {
     http: reqwest::Client,
-    base: String,
+    /// Shared so cloned `Embedder`s (the build clones one per job) balance over
+    /// the *same* live in-flight counters rather than diverging per clone.
+    backends: Arc<Vec<Backend>>,
     model: String,
     /// Optional bearer token sent as `Authorization: Bearer <key>`. vLLM ignores
     /// it unless launched with `--api-key`; Ollama ignores it entirely.
     api_key: Option<String>,
 }
 
+/// A reservation on the least-loaded backend: increments its in-flight count on
+/// acquisition and decrements on drop, so the count tracks a request for its full
+/// lifetime (including early returns on error).
+struct BackendLease<'a> {
+    backend: &'a Backend,
+}
+
+impl<'a> BackendLease<'a> {
+    fn base(&self) -> &str {
+        &self.backend.base
+    }
+}
+
+impl Drop for BackendLease<'_> {
+    fn drop(&mut self) {
+        self.backend.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl Embedder {
-    /// Build a client for `model` against the OpenAI-compatible server at `base`
-    /// (e.g. `http://localhost:11434` for Ollama or `http://localhost:8000` for
-    /// vLLM). `api_key`, when set, is sent as a bearer token.
+    /// Build a client for `model` against the OpenAI-compatible server(s) at
+    /// `base` (e.g. `http://localhost:11434` for Ollama or `http://localhost:8000`
+    /// for vLLM). `api_key`, when set, is sent as a bearer token.
+    ///
+    /// `base` may be a comma-separated list of addresses serving the same model
+    /// (replicas); requests are then balanced across them by least connections.
     pub fn new(base: &str, model: impl Into<String>, api_key: Option<String>) -> Result<Self> {
-        reqwest::Url::parse(base).with_context(|| format!("invalid embed host {base}"))?;
+        let backends: Vec<Backend> = base
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                reqwest::Url::parse(s).with_context(|| format!("invalid embed host {s}"))?;
+                Ok(Backend {
+                    base: s.trim_end_matches('/').to_string(),
+                    inflight: AtomicUsize::new(0),
+                })
+            })
+            .collect::<Result<_>>()?;
+        if backends.is_empty() {
+            bail!("no embed host provided in {base:?}");
+        }
         Ok(Self {
             http: reqwest::Client::new(),
-            base: base.trim_end_matches('/').to_string(),
+            backends: Arc::new(backends),
             model: model.into(),
             api_key,
         })
+    }
+
+    /// Reserve the backend with the fewest in-flight requests (least-connections),
+    /// counting this request against it until the returned lease is dropped. A
+    /// single backend short-circuits the scan.
+    fn lease(&self) -> BackendLease<'_> {
+        let backend = self
+            .backends
+            .iter()
+            .min_by_key(|b| b.inflight.load(Ordering::Relaxed))
+            .expect("Embedder always has at least one backend");
+        backend.inflight.fetch_add(1, Ordering::Relaxed);
+        BackendLease { backend }
     }
 
     /// The model name this embedder targets.
@@ -51,7 +121,10 @@ impl Embedder {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let url = format!("{}/v1/embeddings", self.base);
+        // Held for the whole request so the in-flight count — and thus the
+        // least-connections choice for concurrent calls — stays accurate.
+        let lease = self.lease();
+        let url = format!("{}/v1/embeddings", lease.base());
         let body = EmbedRequest {
             model: &self.model,
             input: inputs,
@@ -198,6 +271,50 @@ struct EmbedDatum {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parses_single_and_multi_host() {
+        let one = Embedder::new("http://h:8000/", "m", None).unwrap();
+        assert_eq!(one.backends.len(), 1);
+        // Trailing slash trimmed, so the request path joins cleanly.
+        assert_eq!(one.backends[0].base, "http://h:8000");
+
+        let many = Embedder::new("http://a:8000, http://b:8000 ,", "m", None).unwrap();
+        assert_eq!(many.backends.len(), 2, "blank entry from trailing comma ignored");
+        assert_eq!(many.backends[1].base, "http://b:8000");
+
+        assert!(Embedder::new("not a url", "m", None).is_err());
+        assert!(Embedder::new(" , ", "m", None).is_err(), "no usable host");
+    }
+
+    #[test]
+    fn lease_picks_least_loaded_and_releases_on_drop() {
+        let e = Embedder::new("http://a:8000,http://b:8000,http://c:8000", "m", None).unwrap();
+
+        // First lease takes any backend (all at 0); pin the rest above it so the
+        // next picks count deterministically.
+        let l1 = e.lease();
+        assert_eq!(e.backends.iter().map(|b| b.inflight.load(Ordering::Relaxed)).sum::<usize>(), 1);
+
+        // Two more leases must land on the two still at zero — never doubling up
+        // on l1's backend while idle ones remain.
+        let l2 = e.lease();
+        let l3 = e.lease();
+        for b in e.backends.iter() {
+            assert_eq!(b.inflight.load(Ordering::Relaxed), 1, "load spread one-each");
+        }
+
+        drop(l2);
+        // The freed backend is now the least loaded, so the next lease reuses it.
+        let l4 = e.lease();
+        let max = e.backends.iter().map(|b| b.inflight.load(Ordering::Relaxed)).max().unwrap();
+        assert_eq!(max, 1, "reused the idle backend rather than stacking");
+        drop((l1, l3, l4));
+
+        for b in e.backends.iter() {
+            assert_eq!(b.inflight.load(Ordering::Relaxed), 0, "all released on drop");
+        }
+    }
 
     #[test]
     fn request_serializes_model_and_input() {

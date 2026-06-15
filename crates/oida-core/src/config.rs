@@ -56,6 +56,15 @@ pub const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// overhead-bound rather than GPU-bound. Too large can overflow the model
 /// runner's context, so it is bounded and tunable.
 pub const DEFAULT_EMBED_BATCH: usize = 64;
+/// Default ordered look-ahead window for the embed stage, as a multiple of
+/// `embed_concurrency`, used when `embed_lookahead` is left at 0 (auto). The
+/// embed stage emits results in document order (the writer/resume invariant),
+/// but decouples that ordering window from the count of concurrent requests: a
+/// slow request only stalls *output*, while this many jobs stay available to
+/// keep `embed_concurrency` requests in flight. Larger absorbs more per-request
+/// latency variance (better GPU utilization) at the cost of more buffered jobs
+/// in memory; 8× covers heavy-tailed latency without much memory.
+pub const DEFAULT_EMBED_LOOKAHEAD_FACTOR: usize = 8;
 /// Whether, by default, a query verifies that the configured embed model name
 /// matches the one recorded in the index. Pinning is by name alone (no portable
 /// content digest across servers), so set the name to encode a weights identity
@@ -81,6 +90,10 @@ pub struct Config {
     /// Base URL of the OpenAI-compatible server used for embeddings. Kept
     /// separate from `ollama_host` so embeddings can be served by a faster
     /// sidecar (e.g. vLLM) while chat stays on Ollama.
+    ///
+    /// May be a comma-separated list of replica addresses serving the same model;
+    /// requests are then balanced across them by least connections (client-side,
+    /// so no external load balancer is required).
     pub embed_host: String,
     /// Optional bearer token sent with embed requests (vLLM `--api-key`).
     pub embed_api_key: Option<String>,
@@ -122,6 +135,14 @@ pub struct Config {
     /// Larger amortizes per-request overhead; keep below what the model runner's
     /// context can hold for one request.
     pub embed_batch: usize,
+    /// Ordered look-ahead window for the embed stage, in jobs. The stage still
+    /// emits in document order, but this many embed jobs may be buffered ahead so
+    /// a slow request stalls only the *output*, not the `embed_concurrency`
+    /// requests kept in flight — keeping the GPU fed despite per-request latency
+    /// variance. 0 means auto (`DEFAULT_EMBED_LOOKAHEAD_FACTOR` × concurrency);
+    /// values below `embed_concurrency` are raised to it. Costs buffered jobs in
+    /// memory, bounded by this window.
+    pub embed_lookahead: usize,
     /// Verify, before serving a query, that `embed_model` matches the model
     /// name recorded in the index. Pinning is by name only; turn this off to
     /// bypass the check (e.g. when intentionally serving with a renamed model).
@@ -147,6 +168,7 @@ impl Default for Config {
             embed_concurrency: DEFAULT_EMBED_CONCURRENCY,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
             embed_batch: DEFAULT_EMBED_BATCH,
+            embed_lookahead: 0,
             embed_verify_model: DEFAULT_EMBED_VERIFY_MODEL,
         }
     }

@@ -43,7 +43,9 @@ struct Args {
     ollama_host: Option<String>,
 
     /// OpenAI-compatible host URL for embeddings, e.g. a vLLM sidecar at
-    /// `http://localhost:8000` (overrides config).
+    /// `http://localhost:8000` (overrides config). Accepts a comma-separated list
+    /// of replica addresses to balance across by least connections, e.g.
+    /// `http://vllm-a:8000,http://vllm-b:8000`.
     #[arg(long, env = "OIDA_EMBED_HOST")]
     embed_host: Option<String>,
 
@@ -91,6 +93,12 @@ struct Args {
     /// Text chunks per embed request during a full-text build (overrides config).
     #[arg(long, env = "OIDA_EMBED_BATCH")]
     embed_batch: Option<usize>,
+
+    /// Ordered look-ahead window (in jobs) for the embed stage during a full-text
+    /// build; 0 = auto (8× concurrency). Decouples output ordering from request
+    /// concurrency so a slow request can't starve the backend (overrides config).
+    #[arg(long, env = "OIDA_EMBED_LOOKAHEAD")]
+    embed_lookahead: Option<usize>,
 
     /// Verify the configured embed model name matches the index's at query time
     /// (overrides config). Pass `--embed-verify-model false` to bypass.
@@ -185,6 +193,9 @@ fn apply_overrides(config: &mut Config, args: &Args) {
     }
     if let Some(v) = args.embed_batch {
         config.embed_batch = v;
+    }
+    if let Some(v) = args.embed_lookahead {
+        config.embed_lookahead = v;
     }
     if let Some(v) = args.embed_verify_model {
         config.embed_verify_model = v;

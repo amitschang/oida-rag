@@ -33,7 +33,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::FtsIndexBuilder;
@@ -43,7 +43,7 @@ use lancedb::table::{CompactionOptions, OptimizeAction};
 use lancedb::{Connection, Table};
 
 use crate::artifacts::{ArtifactTextStatus, artifact_path, read_artifact_text};
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_EMBED_LOOKAHEAD_FACTOR};
 use crate::embed::Embedder;
 use crate::index::Index;
 use crate::ingest::connect;
@@ -357,6 +357,14 @@ pub async fn build(
     let concurrency = config.embed_concurrency.max(1);
     let read_concurrency = config.read_concurrency.max(1);
     let embed_batch = config.embed_batch.max(1);
+    // Ordered look-ahead window for the embed stage. 0 means auto; never below
+    // `concurrency`, or the window would throttle the request slots it feeds.
+    let lookahead = if config.embed_lookahead == 0 {
+        concurrency.saturating_mul(DEFAULT_EMBED_LOOKAHEAD_FACTOR)
+    } else {
+        config.embed_lookahead
+    }
+    .max(concurrency);
     let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<ChunkRow>>(concurrency * 2);
     let (out_tx, out_rx) = mpsc::channel::<RecordBatch>(concurrency * 2);
 
@@ -389,8 +397,11 @@ pub async fn build(
         let embedder = embedder.clone();
         let progress = progress.clone();
         tokio::spawn(async move {
-            run_embedder(embedder, jobs_rx, out_tx, seed_dim, prior_chunks, concurrency, &progress)
-                .await
+            run_embedder(
+                embedder, jobs_rx, out_tx, seed_dim, prior_chunks, concurrency, lookahead,
+                &progress,
+            )
+            .await
         })
     };
 
@@ -663,9 +674,17 @@ async fn run_reader(
     ReaderStats { docs, missing }
 }
 
-/// Embedder stage: embed jobs with up to `concurrency` Ollama requests in flight
-/// at once (via `buffered`, which preserves input order) and forward the
-/// resulting batches to the writer in document order. Returns the embedding
+/// Embedder stage: embed jobs while keeping up to `concurrency` requests in
+/// flight, and forward the resulting batches to the writer in document order.
+///
+/// Ordering and concurrency are decoupled. `buffered(lookahead)` preserves input
+/// (document) order with a window of `lookahead` jobs, while a semaphore caps the
+/// actual in-flight embed requests at `concurrency`. This keeps the ordering
+/// guarantee the writer/resume invariant depends on, but stops a single slow
+/// request from starving the backend: a slow head only stalls *output* ordering,
+/// while the other windowed jobs keep all `concurrency` request slots busy. (With
+/// `lookahead == concurrency` the two collapse and a slow head idles the backend
+/// until it completes — the pathology this split avoids.) Returns the embedding
 /// dimension (seeded from a resume, else discovered) and the cumulative chunk
 /// count (prior chunks plus those embedded here).
 async fn run_embedder(
@@ -675,28 +694,37 @@ async fn run_embedder(
     seed_dim: Option<usize>,
     prior_chunks: u64,
     concurrency: usize,
+    lookahead: usize,
     progress: &Progress,
 ) -> Result<(Option<usize>, u64)> {
-    // Adapt the channel into a Stream so `buffered` can drive N embeds at once.
+    // Caps concurrent embed requests independently of the ordered window above.
+    let in_flight = Arc::new(Semaphore::new(concurrency));
+    // Adapt the channel into a Stream so `buffered` can drive the window.
     let jobs = futures::stream::unfold(jobs_rx, |mut rx| async move {
         rx.recv().await.map(|rows| (rows, rx))
     });
     let embedded = jobs
         .map(|rows| {
             let embedder = embedder.clone();
+            let in_flight = in_flight.clone();
             async move {
-                // A job leaves the read→embed backlog as it enters the embed stage.
+                // A job leaves the read→embed backlog as it enters the window.
                 progress.jobs_queued.fetch_sub(1, Ordering::Relaxed);
                 let n = rows.len();
                 let bytes: u64 = rows.iter().map(|r| r.text.len() as u64).sum();
+                // Hold a permit only across the request itself, so the gauge and
+                // the backend see exactly `concurrency` in flight regardless of
+                // how far the ordered window reads ahead.
+                let permit = in_flight.acquire().await.expect("embed semaphore is never closed");
                 progress.embeds_inflight.fetch_add(1, Ordering::Relaxed);
                 let result = embed_job(&embedder, &rows).await;
                 progress.embeds_inflight.fetch_sub(1, Ordering::Relaxed);
+                drop(permit);
                 let (batch, d) = result?;
                 Ok::<(RecordBatch, usize, usize, u64), anyhow::Error>((batch, d, n, bytes))
             }
         })
-        .buffered(concurrency);
+        .buffered(lookahead);
     // `unfold` yields a `!Unpin` stream; pin it so `.next()` is callable.
     futures::pin_mut!(embedded);
 
