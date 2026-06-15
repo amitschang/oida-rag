@@ -69,6 +69,25 @@ struct Progress {
     text_bytes: AtomicU64,
     /// Referenced artifact files that were not on disk.
     missing: AtomicU64,
+    /// Live pipeline gauges — instantaneous depths, not cumulative totals — to
+    /// locate the bottleneck. The stage where work piles up is downstream of the
+    /// stall; the stage that runs below its limit is being starved by it.
+    ///
+    /// Read tasks currently executing on the blocking pool. Pinned near
+    /// `read_concurrency` when reads keep up; collapsing toward 1 despite a high
+    /// limit is the signature of head-of-line blocking in the order-preserving
+    /// reader (one slow artifact stalls every read queued behind it).
+    reads_inflight: AtomicU64,
+    /// Read+chunked jobs waiting in the channel for a free embed slot. Near the
+    /// channel cap ⇒ the embedder is the bottleneck; near 0 ⇒ the reader can't
+    /// keep the embedder fed.
+    jobs_queued: AtomicU64,
+    /// Embed requests in flight to the backend. Pinned near `embed_concurrency`
+    /// ⇒ the GPUs are saturated; below it ⇒ the embedder is starved upstream.
+    embeds_inflight: AtomicU64,
+    /// Embedded batches waiting in the channel for the writer. Near the channel
+    /// cap ⇒ LanceDB write backpressure is the bottleneck.
+    out_queued: AtomicU64,
 }
 
 /// A single fused chunk hit, before hydration into a full document.
@@ -239,7 +258,7 @@ impl HybridIndex {
 ///
 /// Reads each `text/plain`/`.ocr` artifact, splits it into overlapping chunks,
 /// embeds the chunks with `embedder`, and writes them to LanceDB along with a
-/// `_meta` row pinning the embed model and its digest. Pass `force` to replace
+/// `_meta` row pinning the embed model name. Pass `force` to replace
 /// an existing index.
 ///
 /// Pass `resume` to continue an interrupted build: the existing `chunks` table
@@ -380,7 +399,7 @@ pub async fn build(
     // failure drops `out_rx`, which unblocks the upstream stages (their sends
     // fail and they wind down), so we can surface it before joining them.
     let writer_db = db.clone();
-    let table = run_writer(&writer_db, resumed_table, out_rx, config.write_buffer_bytes)
+    let table = run_writer(&writer_db, resumed_table, out_rx, config.write_buffer_bytes, &progress)
         .await
         .context("writing chunk fragments")?;
 
@@ -578,10 +597,12 @@ async fn run_reader(
         .map(|(doc_id, name, media_type)| {
             let cfg = cfg.clone();
             async move {
+                progress.reads_inflight.fetch_add(1, Ordering::Relaxed);
                 let outcome = tokio::task::spawn_blocking(move || {
                     read_one(&cfg, &doc_id, &name, media_type.as_deref())
                 })
                 .await;
+                progress.reads_inflight.fetch_sub(1, Ordering::Relaxed);
                 progress.scanned.fetch_add(1, Ordering::Relaxed);
                 outcome
             }
@@ -628,6 +649,7 @@ async fn run_reader(
         // into full embed requests for backend efficiency.
         while pending.len() >= embed_batch {
             let job: Vec<ChunkRow> = pending.drain(..embed_batch).collect();
+            progress.jobs_queued.fetch_add(1, Ordering::Relaxed);
             if jobs_tx.send(job).await.is_err() {
                 // Embed stage went away (it errored); stop reading.
                 return ReaderStats { docs, missing };
@@ -635,6 +657,7 @@ async fn run_reader(
         }
     }
     if !pending.is_empty() {
+        progress.jobs_queued.fetch_add(1, Ordering::Relaxed);
         let _ = jobs_tx.send(pending).await;
     }
     ReaderStats { docs, missing }
@@ -662,9 +685,14 @@ async fn run_embedder(
         .map(|rows| {
             let embedder = embedder.clone();
             async move {
+                // A job leaves the read→embed backlog as it enters the embed stage.
+                progress.jobs_queued.fetch_sub(1, Ordering::Relaxed);
                 let n = rows.len();
                 let bytes: u64 = rows.iter().map(|r| r.text.len() as u64).sum();
-                let (batch, d) = embed_job(&embedder, &rows).await?;
+                progress.embeds_inflight.fetch_add(1, Ordering::Relaxed);
+                let result = embed_job(&embedder, &rows).await;
+                progress.embeds_inflight.fetch_sub(1, Ordering::Relaxed);
+                let (batch, d) = result?;
                 Ok::<(RecordBatch, usize, usize, u64), anyhow::Error>((batch, d, n, bytes))
             }
         })
@@ -687,6 +715,7 @@ async fn run_embedder(
         // Publish for the ticker (rendering happens on its own timer).
         progress.chunks.fetch_add(n as u64, Ordering::Relaxed);
         progress.text_bytes.fetch_add(bytes, Ordering::Relaxed);
+        progress.out_queued.fetch_add(1, Ordering::Relaxed);
         if out_tx.send(batch).await.is_err() {
             // Writer stopped (it errored); its error is the real failure and the
             // caller surfaces it, so just stop pulling.
@@ -743,6 +772,10 @@ async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: one
         let bytes = progress.text_bytes.load(Ordering::Relaxed);
         let scanned = progress.scanned.load(Ordering::Relaxed);
         let missing = progress.missing.load(Ordering::Relaxed);
+        let reads_inflight = progress.reads_inflight.load(Ordering::Relaxed);
+        let jobs_queued = progress.jobs_queued.load(Ordering::Relaxed);
+        let embeds_inflight = progress.embeds_inflight.load(Ordering::Relaxed);
+        let out_queued = progress.out_queued.load(Ordering::Relaxed);
 
         if run_start.is_none() && chunks > initial_chunks {
             run_start = Some(now);
@@ -771,7 +804,9 @@ async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: one
 
         let line = format!(
             "{chunks} chunks | 1m: {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tok/s | \
-             avg: {avg_cps:.0} ch/s | {scanned}/{total_artifacts} scanned | {missing} missing",
+             avg: {avg_cps:.0} ch/s | pipe: rd {reads_inflight} \u{2192} q {jobs_queued} \u{2192} \
+             emb {embeds_inflight} \u{2192} q {out_queued} | {scanned}/{total_artifacts} scanned | \
+             {missing} missing",
             recent_bps / 1.0e6,
             human_count(recent_tps as u64),
         );
@@ -819,10 +854,12 @@ async fn run_writer(
     mut table: Option<Table>,
     mut out_rx: mpsc::Receiver<RecordBatch>,
     threshold: usize,
+    progress: &Progress,
 ) -> Result<Option<Table>> {
     let mut buffer: Vec<RecordBatch> = Vec::new();
     let mut buffer_bytes: usize = 0;
     while let Some(batch) = out_rx.recv().await {
+        progress.out_queued.fetch_sub(1, Ordering::Relaxed);
         buffer_bytes += batch.get_array_memory_size();
         buffer.push(batch);
         if buffer_bytes >= threshold {
