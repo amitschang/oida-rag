@@ -13,8 +13,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::default();
 
     if !Index::is_ingested(&config).await {
-        eprintln!("== ingesting metadata (one-time) ==");
-        Index::ingest_metadata(&config, false).await?;
+        eprintln!("== ingesting metadata from Solr (one-time) ==");
+        oida_core::ingest::ingest_from_solr(&config, None, false).await?;
     }
 
     let index = Index::open(&config).await?;

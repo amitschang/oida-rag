@@ -21,6 +21,29 @@ pub struct Artifact {
     pub md5: Option<String>,
 }
 
+/// The stored bytes of a single non-text artifact, returned by a `(id, name)`
+/// point lookup against the `raw_artifacts` table.
+///
+/// That pair uniquely identifies one artifact file, so it is the only
+/// retrieval mode raw storage supports — the table exists to return the
+/// original bytes, never to be scanned in bulk.
+#[derive(Debug, Clone)]
+pub struct RawArtifact {
+    /// Document id this artifact belongs to.
+    pub document_id: String,
+    /// File name on disk (the second half of the lookup key).
+    pub name: String,
+    /// MIME type, e.g. `application/pdf`, `image/png`.
+    pub media_type: Option<String>,
+    /// MD5 checksum, if known.
+    pub md5: Option<String>,
+    /// Size in bytes, if known. Reflects the source's reported size, which the
+    /// stored `data` length should match.
+    pub size: Option<u64>,
+    /// The original file bytes.
+    pub data: Vec<u8>,
+}
+
 /// Document-level metadata, deduplicated from the per-artifact parquet rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Document {

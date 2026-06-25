@@ -21,9 +21,6 @@ fn load_config() -> anyhow::Result<Config> {
     let path = std::env::var("OIDA_CONFIG").unwrap_or_else(|_| "oida.toml".to_string());
     let mut config = Config::load(&path)?;
     // Environment overrides (handy without a config file).
-    if let Ok(v) = std::env::var("OIDA_PARQUET") {
-        config.parquet_path = v.into();
-    }
     if let Ok(v) = std::env::var("OIDA_ARTIFACT_ROOT") {
         config.artifact_root = Some(v.into());
     }

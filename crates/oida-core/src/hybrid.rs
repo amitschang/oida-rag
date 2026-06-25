@@ -22,7 +22,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +34,7 @@ use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use lance_index::scalar::FullTextSearchQuery;
+use lancedb::arrow::SendableRecordBatchStream;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
@@ -42,11 +42,12 @@ use lancedb::rerankers::rrf::RRFReranker;
 use lancedb::table::{CompactionOptions, OptimizeAction};
 use lancedb::{Connection, Table};
 
-use crate::artifacts::{ArtifactTextStatus, artifact_path, read_artifact_text};
+use crate::artifacts::is_text;
 use crate::config::{Config, DEFAULT_EMBED_LOOKAHEAD_FACTOR};
 use crate::embed::Embedder;
-use crate::index::Index;
+use crate::index::{Index, text_refs_from_batch};
 use crate::ingest::connect;
+use crate::source::ArtifactSource;
 
 /// Name of the table holding text chunks and their embeddings.
 const CHUNKS_TABLE: &str = "chunks";
@@ -60,9 +61,12 @@ const MIN_VECTOR_INDEX_ROWS: usize = 256;
 /// the progress ticker. Decoupling counting (hot path) from rendering (timer)
 /// keeps display cadence independent of work cadence.
 #[derive(Default)]
-struct Progress {
+pub(crate) struct Progress {
     /// Artifacts the reader has walked (whether read, skipped, or missing).
     scanned: AtomicU64,
+    /// Total text artifacts to index, the progress denominator (0 until the
+    /// reader has been handed the artifact list).
+    text_total: AtomicU64,
     /// Chunks embedded so far (includes any seeded from a resume).
     chunks: AtomicU64,
     /// Bytes of chunk text embedded so far, for a throughput/token estimate.
@@ -277,13 +281,46 @@ pub async fn build(
     force: bool,
     resume: bool,
 ) -> Result<IndexStats> {
-    if config.artifact_root.is_none() {
-        bail!("artifact_root is not configured; the hybrid index needs the text files on disk");
-    }
+    // Standalone build owns its own progress and ticker. The concurrent
+    // orchestrator instead drives `build_with_progress` with a shared ticker so
+    // raw storage and the text build render on one status line.
+    let progress = Arc::new(Progress::default());
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let ticker = {
+        let progress = progress.clone();
+        tokio::spawn(run_ticker(progress, None, stop_rx))
+    };
+    let result = build_with_progress(config, index, embedder, force, resume, progress).await;
+    let _ = stop_tx.send(());
+    let _ = ticker.await;
+    result
+}
 
+/// Build the full-text index, reporting into the supplied shared `progress`.
+///
+/// Identical to [`build`] but with the progress counters and ticker owned by
+/// the caller, so the concurrent raw + full-text orchestrator can render both
+/// passes on a single status line.
+pub(crate) async fn build_with_progress(
+    config: &Config,
+    index: &Index,
+    embedder: &Embedder,
+    force: bool,
+    resume: bool,
+    progress: Arc<Progress>,
+) -> Result<IndexStats> {
     if force && resume {
         bail!("force and resume are mutually exclusive");
     }
+
+    // Resolve the artifact source (local directory or S3 bucket) once; the
+    // reader pulls every text artifact through it.
+    let source = Arc::new(ArtifactSource::from_config(config)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no artifact source configured (set artifact_root or s3_bucket); \
+             the hybrid index needs the text files"
+        )
+    })?);
 
     let db = connect(config).await?;
     let existing = db.table_names().execute().await.context("listing tables")?;
@@ -302,8 +339,8 @@ pub async fn build(
         }
     }
 
-    let artifacts = index.text_artifacts().await.context("listing text artifacts")?;
-    let total_artifacts = artifacts.len();
+    let total_artifacts = index.text_count().await.context("counting text artifacts")? as usize;
+    progress.text_total.store(total_artifacts as u64, Ordering::Relaxed);
     tracing::info!("indexing text from {total_artifacts} artifacts");
 
     // Resume seeds: a prior (interrupted) build's already-indexed documents are
@@ -355,8 +392,6 @@ pub async fn build(
     // in document order and keeps durable writes aligned to document boundaries
     // — the invariant `resume` depends on (a `doc_id` in the table is complete).
     let concurrency = config.embed_concurrency.max(1);
-    let read_concurrency = config.read_concurrency.max(1);
-    let embed_batch = config.embed_batch.max(1);
     // Ordered look-ahead window for the embed stage. 0 means auto; never below
     // `concurrency`, or the window would throttle the request slots it feeds.
     let lookahead = if config.embed_lookahead == 0 {
@@ -368,27 +403,25 @@ pub async fn build(
     let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<ChunkRow>>(concurrency * 2);
     let (out_tx, out_rx) = mpsc::channel::<RecordBatch>(concurrency * 2);
 
-    // Shared live counters and the timer-driven ticker that renders them. The
-    // chunk counter is seeded with the resumed total so the displayed figure is
-    // cumulative.
-    let progress = Arc::new(Progress::default());
+    // Shared live counters seeded with the resumed chunk total so the displayed
+    // figure is cumulative. The ticker that renders `progress` is owned by the
+    // caller ([`build`] or the concurrent orchestrator).
     progress.chunks.store(prior_chunks, Ordering::Relaxed);
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let ticker = {
-        let progress = progress.clone();
-        tokio::spawn(run_ticker(progress, total_artifacts as u64, stop_rx))
-    };
 
     // Reader: read + chunk up to `read_concurrency` files at once (each on the
     // blocking pool), emitting chunks in document order. Concurrent reads keep a
     // fast embed backend fed when per-file storage latency would otherwise starve
     // a single serial reader.
+    let artifacts = index
+        .text_artifacts_stream()
+        .await
+        .context("streaming text artifacts")?;
     let reader = {
         let cfg = config.clone();
         let progress = progress.clone();
+        let source = source.clone();
         tokio::spawn(async move {
-            run_reader(&cfg, artifacts, done, embed_batch, read_concurrency, &progress, jobs_tx)
-                .await
+            run_reader(&cfg, source, artifacts, done, &progress, jobs_tx).await
         })
     };
 
@@ -417,9 +450,6 @@ pub async fn build(
     let ReaderStats { docs: new_docs, missing } =
         reader.await.context("reader task panicked")?;
     let (dim, chunk_count) = embed_stage.await.context("embedder task panicked")??;
-    // Stop the ticker and let it print its final summary line.
-    let _ = stop_tx.send(());
-    let _ = ticker.await;
     let doc_count = prior_docs + new_docs;
 
     if missing > 0 {
@@ -538,25 +568,39 @@ enum ReadOutcome {
     Empty,
 }
 
-/// Read and chunk one artifact. Pure blocking file I/O plus CPU chunking, so it
-/// is safe — and the point — to run many of these at once on the blocking pool.
-fn read_one(config: &Config, doc_id: &str, name: &str, media_type: Option<&str>) -> ReadOutcome {
-    // u64::MAX / 2 reads the whole file without risking an offset overflow.
-    let loaded = read_artifact_text(config, name, media_type, 0, u64::MAX / 2);
-    match loaded.status {
-        ArtifactTextStatus::TextLoaded => {}
-        // A referenced file may legitimately be absent (e.g. redacted documents
-        // are pulled from disk), so a miss is not fatal; the caller counts it.
-        ArtifactTextStatus::ArtifactFileMissing => {
+/// Read and chunk one artifact. Fetches the text through the [`ArtifactSource`]
+/// (local or S3) and splits it into overlapping chunks. A missing file is not
+/// fatal (the caller counts it); a non-text artifact or empty body yields
+/// nothing.
+async fn read_one(
+    source: &ArtifactSource,
+    config: &Config,
+    doc_id: &str,
+    name: &str,
+    media_type: Option<&str>,
+) -> ReadOutcome {
+    // The listing should already exclude non-text artifacts, but skip defensively
+    // rather than fetch bytes we cannot use.
+    if !is_text(name, media_type) {
+        return ReadOutcome::Empty;
+    }
+    let bytes = match source.get(doc_id, name).await {
+        Ok(Some(bytes)) => bytes,
+        // A referenced file may legitimately be absent (e.g. redacted documents),
+        // so a miss is not fatal; the caller counts it.
+        Ok(None) => {
             return ReadOutcome::Missing { doc_id: doc_id.to_string(), name: name.to_string() };
         }
-        // Not a text type we read in v1 (the listing should already exclude
-        // these, but skip defensively rather than fail the whole build).
-        ArtifactTextStatus::UnsupportedArtifactType
-        | ArtifactTextStatus::ArtifactRootNotConfigured => return ReadOutcome::Empty,
+        Err(e) => {
+            tracing::warn!("error reading artifact '{name}' (doc {doc_id}): {e:#}; skipping");
+            return ReadOutcome::Empty;
+        }
+    };
+    let body = String::from_utf8_lossy(&bytes);
+    if body.is_empty() {
+        return ReadOutcome::Empty;
     }
-    let Some(body) = loaded.text else { return ReadOutcome::Empty };
-    let rows = chunk_text(&body, config.chunk_bytes, config.chunk_overlap)
+    let rows = chunk_text(body.as_ref(), config.chunk_bytes, config.chunk_overlap)
         .into_iter()
         .enumerate()
         .map(|(idx, chunk)| ChunkRow {
@@ -575,95 +619,117 @@ fn read_one(config: &Config, doc_id: &str, name: &str, media_type: Option<&str>)
 /// so the writer still sees whole documents in order — the invariant `resume`
 /// depends on. Returns once the listing is exhausted or the embed stage has gone
 /// away.
+///
+/// `artifacts` is a stream ordered by `(id, name)` (see
+/// [`Index::text_artifacts_stream`]), drained one batch at a time so the listing
+/// is never fully resident — at full-corpus scale it would be gigabytes. A batch
+/// is read to completion before the next begins, which keeps document order
+/// intact across batch boundaries: a document is a contiguous run in the ordered
+/// stream, so its trailing artifacts in one batch are immediately followed by
+/// the rest at the head of the next, with no other document interleaved.
 async fn run_reader(
     config: &Config,
-    artifacts: Vec<(String, String, Option<String>)>,
+    source: Arc<ArtifactSource>,
+    mut artifacts: SendableRecordBatchStream,
     done: HashSet<String>,
-    embed_batch: usize,
-    read_concurrency: usize,
     progress: &Progress,
     jobs_tx: mpsc::Sender<Vec<ChunkRow>>,
 ) -> ReaderStats {
-    // Sequential pre-pass: drop documents a prior build already indexed and count
-    // distinct (non-skipped) documents. This is cheap (no I/O), so it does not
-    // hold up the concurrent reads that follow.
-    let mut to_read: Vec<(String, String, Option<String>)> = Vec::with_capacity(artifacts.len());
-    let mut docs = 0u64;
-    let mut last_doc: Option<&str> = None;
-    for (doc_id, name, media_type) in artifacts.iter() {
-        if done.contains(doc_id) {
-            progress.scanned.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if last_doc != Some(doc_id.as_str()) {
-            docs += 1;
-            last_doc = Some(doc_id);
-        }
-        to_read.push((doc_id.clone(), name.clone(), media_type.clone()));
-    }
-
-    // Share the config into the per-file blocking reads without recloning it.
+    let read_concurrency = config.read_concurrency.max(1);
+    let embed_batch = config.embed_batch.max(1);
+    // Share the config into the per-file reads without recloning it.
     let cfg = Arc::new(config.clone());
-    let reads = futures::stream::iter(to_read)
-        .map(|(doc_id, name, media_type)| {
-            let cfg = cfg.clone();
-            async move {
-                progress.reads_inflight.fetch_add(1, Ordering::Relaxed);
-                let outcome = tokio::task::spawn_blocking(move || {
-                    read_one(&cfg, &doc_id, &name, media_type.as_deref())
-                })
-                .await;
-                progress.reads_inflight.fetch_sub(1, Ordering::Relaxed);
-                progress.scanned.fetch_add(1, Ordering::Relaxed);
-                outcome
-            }
-        })
-        .buffered(read_concurrency);
-    futures::pin_mut!(reads);
 
     let mut pending: Vec<ChunkRow> = Vec::new();
     let mut missing = 0u64;
-    while let Some(joined) = reads.next().await {
-        let outcome = match joined {
-            Ok(o) => o,
-            // A read task panicked — log and skip that artifact rather than abort
-            // the whole build over one file.
+    let mut docs = 0u64;
+    // Last document fed into the read pipeline, tracked across batches so the
+    // distinct-document count is right even when a document's artifacts straddle
+    // a batch boundary (the stream is ordered, so a document is a contiguous
+    // run).
+    let mut last_doc: Option<String> = None;
+
+    loop {
+        let batch = match artifacts.try_next().await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
             Err(e) => {
-                tracing::error!("artifact read task panicked: {e}");
-                continue;
+                tracing::error!("error reading text-artifact listing: {e:#}");
+                break;
             }
         };
-        match outcome {
-            ReadOutcome::Chunks(rows) => pending.extend(rows),
-            // Warn on the first miss so a wrong artifact_root is obvious; the
-            // end-of-build summary reports the total.
-            ReadOutcome::Missing { doc_id, name } => {
-                if missing == 0 {
-                    let root = config.artifact_root.as_deref().unwrap_or(Path::new(""));
-                    tracing::warn!(
-                        "artifact '{name}' (doc {doc_id}) not found at {}; \
-                         skipping it and any further missing files (e.g. redacted)",
-                        artifact_path(root, &name).display(),
-                    );
-                }
-                missing += 1;
-                progress.missing.fetch_add(1, Ordering::Relaxed);
+        let refs = match text_refs_from_batch(&batch) {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::error!("error decoding text-artifact batch: {e:#}");
+                break;
+            }
+        };
+
+        // Per-batch pre-pass: drop documents a prior build already indexed and
+        // count distinct (non-skipped) documents. This is cheap (no I/O), so it
+        // does not hold up the concurrent reads that follow.
+        let mut to_read: Vec<(String, String, Option<String>)> = Vec::with_capacity(refs.len());
+        for (doc_id, name, media_type) in refs {
+            if done.contains(&doc_id) {
+                progress.scanned.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            ReadOutcome::Empty => continue,
+            if last_doc.as_deref() != Some(doc_id.as_str()) {
+                docs += 1;
+                last_doc = Some(doc_id.clone());
+            }
+            to_read.push((doc_id, name, media_type));
         }
-        // Hand off in `embed_batch`-sized jobs. Drain whole batches in a loop
-        // rather than shipping the leftover `pending` in one shot: a single large
-        // artifact can chunk into thousands of rows, and sending them as one
-        // embed request crashes the model runner. Jobs may span documents — the
-        // writer realigns to document boundaries — so small documents still pack
-        // into full embed requests for backend efficiency.
-        while pending.len() >= embed_batch {
-            let job: Vec<ChunkRow> = pending.drain(..embed_batch).collect();
-            progress.jobs_queued.fetch_add(1, Ordering::Relaxed);
-            if jobs_tx.send(job).await.is_err() {
-                // Embed stage went away (it errored); stop reading.
-                return ReaderStats { docs, missing };
+
+        let reads = futures::stream::iter(to_read)
+            .map(|(doc_id, name, media_type)| {
+                let cfg = cfg.clone();
+                let source = source.clone();
+                async move {
+                    progress.reads_inflight.fetch_add(1, Ordering::Relaxed);
+                    let outcome =
+                        read_one(&source, &cfg, &doc_id, &name, media_type.as_deref()).await;
+                    progress.reads_inflight.fetch_sub(1, Ordering::Relaxed);
+                    progress.scanned.fetch_add(1, Ordering::Relaxed);
+                    outcome
+                }
+            })
+            .buffered(read_concurrency);
+        futures::pin_mut!(reads);
+
+        while let Some(outcome) = reads.next().await {
+            match outcome {
+                ReadOutcome::Chunks(rows) => pending.extend(rows),
+                // Warn on the first miss so a wrong source is obvious; the
+                // end-of-build summary reports the total.
+                ReadOutcome::Missing { doc_id, name } => {
+                    if missing == 0 {
+                        tracing::warn!(
+                            "artifact '{name}' (doc {doc_id}) not found at {}; \
+                             skipping it and any further missing files (e.g. redacted)",
+                            source.key_display(&doc_id, &name),
+                        );
+                    }
+                    missing += 1;
+                    progress.missing.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                ReadOutcome::Empty => continue,
+            }
+            // Hand off in `embed_batch`-sized jobs. Drain whole batches in a loop
+            // rather than shipping the leftover `pending` in one shot: a single
+            // large artifact can chunk into thousands of rows, and sending them as
+            // one embed request crashes the model runner. Jobs may span documents
+            // — the writer realigns to document boundaries — so small documents
+            // still pack into full embed requests for backend efficiency.
+            while pending.len() >= embed_batch {
+                let job: Vec<ChunkRow> = pending.drain(..embed_batch).collect();
+                progress.jobs_queued.fetch_add(1, Ordering::Relaxed);
+                if jobs_tx.send(job).await.is_err() {
+                    // Embed stage went away (it errored); stop reading.
+                    return ReaderStats { docs, missing };
+                }
             }
         }
     }
@@ -777,7 +843,14 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// skip/scan phase (which produces no chunks) never enters the rate. On a TTY
 /// it rewrites one line in place; off a TTY (pod logs, pipes) it emits a
 /// periodic newline log. Stops when `stop` fires, printing a final summary.
-async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: oneshot::Receiver<()>) {
+///
+/// When `raw` is supplied (the concurrent raw + full-text build) the line is
+/// prefixed with a raw-download segment so both passes share one status line.
+pub(crate) async fn run_ticker(
+    progress: Arc<Progress>,
+    raw: Option<Arc<crate::raw::RawProgress>>,
+    mut stop: oneshot::Receiver<()>,
+) {
     let tty = std::io::stderr().is_terminal();
     let mut interval =
         tokio::time::interval(Duration::from_millis(if tty { 500 } else { 5000 }));
@@ -800,6 +873,7 @@ async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: one
         let bytes = progress.text_bytes.load(Ordering::Relaxed);
         let scanned = progress.scanned.load(Ordering::Relaxed);
         let missing = progress.missing.load(Ordering::Relaxed);
+        let total_artifacts = progress.text_total.load(Ordering::Relaxed);
         let reads_inflight = progress.reads_inflight.load(Ordering::Relaxed);
         let jobs_queued = progress.jobs_queued.load(Ordering::Relaxed);
         let embeds_inflight = progress.embeds_inflight.load(Ordering::Relaxed);
@@ -838,6 +912,23 @@ async fn run_ticker(progress: Arc<Progress>, total_artifacts: u64, mut stop: one
             recent_bps / 1.0e6,
             human_count(recent_tps as u64),
         );
+        // Prefix the raw-download segment when running concurrently, so both
+        // passes share a single status line.
+        let line = match &raw {
+            Some(raw) => {
+                let stored = raw.stored.load(Ordering::Relaxed);
+                let total = raw.total.load(Ordering::Relaxed);
+                let inflight = raw.inflight.load(Ordering::Relaxed);
+                let raw_bytes = raw.bytes.load(Ordering::Relaxed);
+                let raw_missing = raw.missing.load(Ordering::Relaxed);
+                format!(
+                    "raw: {stored}/{total} files, {} dl, {inflight} active, {raw_missing} missing \
+                     || {line}",
+                    human_bytes(raw_bytes),
+                )
+            }
+            None => line,
+        };
         if tty {
             // \r returns to column 0; \x1b[K clears the rest of the line.
             eprint!("\r\x1b[K{line}");
@@ -869,6 +960,23 @@ fn human_count(n: u64) -> String {
         format!("{:.1}K", n as f64 / 1.0e3)
     } else {
         n.to_string()
+    }
+}
+
+/// Format a byte count with a binary (1024) unit suffix, for the raw-download
+/// segment of the shared progress line.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

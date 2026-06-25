@@ -17,6 +17,7 @@ lance.workspace = true
 datafusion.workspace = true
 arrow.workspace = true
 lance-index.workspace = true
+object_store.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 tokio.workspace = true

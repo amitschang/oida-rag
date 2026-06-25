@@ -60,7 +60,7 @@ impl ArtifactText {
 }
 
 /// Whether an artifact should be treated as readable text in v1.
-fn is_text(name: &str, media_type: Option<&str>) -> bool {
+pub(crate) fn is_text(name: &str, media_type: Option<&str>) -> bool {
     media_type == Some("text/plain") || name.to_lowercase().ends_with(".ocr")
 }
 

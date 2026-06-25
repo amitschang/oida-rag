@@ -1,11 +1,6 @@
 # OIDA assistant configuration. Copy to `oida.toml` and edit.
 # All fields are optional; the values below are the defaults.
 
-# Source parquet index (the source of truth). One row per document, with the
-# document's artifacts inline as a list<struct<md5, mediaType, name, size>>.
-# Ingested into LanceDB by `oida-cli ingest`.
-parquet_path = "oida-index.parquet"
-
 # Directory containing artifact files on disk, keyed by artifact_name.
 # Leave unset if you don't have the artifacts yet; artifact-text tools
 # will report `artifact_root_not_configured` and degrade gracefully.
@@ -45,3 +40,26 @@ compact_on_build = true
 # (better read performance, less metadata) but higher peak memory during ingest.
 # ~512 MiB. Raise on large-memory nodes for fewer files.
 ingest_buffer_bytes = 536870912
+
+# Store raw (non-text) artifact bytes in a `raw_artifacts` blob table during
+# `oida-cli ingest` (also `--store-raw`). The bytes are fetched from the
+# artifact source below; the text/plain OCR chunk index is built regardless.
+# store_raw_artifacts = false
+
+# Target size, in bytes, of each `raw_artifacts` LanceDB fragment. Fetched blobs
+# (whose individual sizes vary widely) accumulate until their combined size
+# reaches this target, then flush as one fragment, keeping file sizes even.
+# Larger = fewer, bigger files at the cost of higher peak memory and a coarser
+# resume checkpoint. ~256 MiB.
+# raw_file_bytes = 268435456
+
+# Artifact source for raw storage and the full-text reader. When `s3_bucket`
+# is set, artifacts are fetched from S3 (using the same fan-out key layout as
+# the on-disk store, under `s3_prefix`) instead of `artifact_root`. S3
+# credentials come from the standard AWS environment (AWS_ACCESS_KEY_ID, …),
+# not this file. `s3_endpoint` targets S3-compatible stores (MinIO, Ceph, R2).
+# s3_bucket = "my-artifacts"
+# s3_region = "us-east-1"
+# s3_endpoint = "https://minio.example.com"
+# s3_prefix = "artifacts"
+

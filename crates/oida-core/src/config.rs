@@ -12,9 +12,6 @@ pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 /// host as the chat agent (Ollama serves `/v1/embeddings` out of the box); point
 /// it at a vLLM sidecar (e.g. `http://localhost:8000`) for higher throughput.
 pub const DEFAULT_EMBED_HOST: &str = "http://localhost:11434";
-/// Default path to the OIDA parquet index (one row per document, artifacts
-/// inline as a `list<struct>` column).
-pub const DEFAULT_PARQUET: &str = "oida-index.parquet";
 /// Default path to the LanceDB database holding the document index.
 pub const DEFAULT_LANCE: &str = "oida-lance";
 /// Default Ollama model used to embed document text for semantic search.
@@ -33,6 +30,14 @@ pub const DEFAULT_CHUNK_OVERLAP: usize = 256;
 pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 128 << 20;
 /// Whether to compact the chunks table after a hybrid-index build by default.
 pub const DEFAULT_COMPACT_ON_BUILD: bool = true;
+/// Default target size, in bytes, of each `raw_artifacts` LanceDB fragment.
+/// Raw storage fetches whole files (PDFs, images, …) of widely varying size, so
+/// flushing a fixed *count* of blobs yields fragments of erratic size. Instead,
+/// fetched blobs accumulate until their combined size reaches this target, then
+/// flush as one fragment — keeping file sizes consistent regardless of the
+/// per-artifact size distribution. Larger means fewer, bigger files (less
+/// metadata) at the cost of higher peak memory and a coarser resume checkpoint.
+pub const DEFAULT_RAW_FILE_BYTES: usize = 256 << 20;
 /// Default in-memory buffer target, in bytes, before the metadata ingest flushes
 /// a LanceDB fragment. Larger values yield fewer, bigger fragments (better read
 /// performance, less metadata) at the cost of higher peak memory during ingest.
@@ -70,6 +75,13 @@ pub const DEFAULT_EMBED_LOOKAHEAD_FACTOR: usize = 8;
 /// content digest across servers), so set the name to encode a weights identity
 /// — a commit hash, a quantization tag, a `num_ctx` variant — and keep this on.
 pub const DEFAULT_EMBED_VERIFY_MODEL: bool = true;
+/// Default Solr `q` selecting the tracked corpus for incremental updates.
+pub const DEFAULT_SOLR_QUERY: &str = "industrycode:OPIOIDS";
+/// Default rows per Solr page (cursorMark paging) during an update.
+pub const DEFAULT_SOLR_PAGE_ROWS: usize = 1000;
+/// Default Solr field holding the archiver metadata-modified date, used as the
+/// incremental watermark (day-resolution; filtered via `fq`, never sorted).
+pub const DEFAULT_SOLR_MODIFIED_FIELD: &str = "ddmudate";
 
 /// Runtime configuration.
 ///
@@ -79,8 +91,6 @@ pub const DEFAULT_EMBED_VERIFY_MODEL: bool = true;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Path to the source parquet index (the source of truth).
-    pub parquet_path: PathBuf,
     /// Directory containing artifact files on disk, keyed by `artifact_name`.
     ///
     /// Optional: when unset, artifact-text tools degrade gracefully.
@@ -147,12 +157,45 @@ pub struct Config {
     /// name recorded in the index. Pinning is by name only; turn this off to
     /// bypass the check (e.g. when intentionally serving with a renamed model).
     pub embed_verify_model: bool,
+    /// Base URL of the archive Solr core used by `update`, e.g.
+    /// `https://metadata.idl.ucsf.edu/solr/ltdl3`. `None` disables `update`;
+    /// unused by the serving path.
+    pub solr_url: Option<String>,
+    /// Solr `q` selecting the corpus to track for updates.
+    pub solr_query: String,
+    /// Rows per Solr page (cursorMark paging) during an update.
+    pub solr_page_rows: usize,
+    /// Solr field carrying the archiver metadata-modified date, used as the
+    /// inclusive lower-bound watermark for incremental updates.
+    pub solr_modified_field: String,
+    /// Whether ingest stores non-text/plain ("raw") artifacts in a
+    /// `raw_artifacts` table, fetched from the artifact source. Off by default;
+    /// the text/plain chunk index is built regardless.
+    pub store_raw_artifacts: bool,
+    /// Target size, in bytes, of each `raw_artifacts` LanceDB fragment. Fetched
+    /// blobs accumulate until their combined size reaches this target, then
+    /// flush as one fragment, so file sizes stay consistent despite widely
+    /// varying per-artifact sizes. Larger = fewer, bigger files (less metadata)
+    /// at the cost of higher peak memory and a coarser resume checkpoint.
+    pub raw_file_bytes: usize,
+    /// S3 bucket holding the artifact files. When set, the ingest/full-text
+    /// reader fetches artifacts from S3 instead of `artifact_root`, using the
+    /// same fan-out key layout under `s3_prefix`. Credentials are read from the
+    /// standard AWS environment (`AWS_ACCESS_KEY_ID`, …).
+    pub s3_bucket: Option<String>,
+    /// AWS region for `s3_bucket` (e.g. `us-east-1`). Optional for S3-compatible
+    /// endpoints that ignore it.
+    pub s3_region: Option<String>,
+    /// Custom S3 endpoint URL, for S3-compatible stores (MinIO, Ceph RGW, R2).
+    /// HTTP endpoints are allowed when this is set.
+    pub s3_endpoint: Option<String>,
+    /// Key prefix prepended to the fan-out artifact path within `s3_bucket`.
+    pub s3_prefix: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            parquet_path: PathBuf::from(DEFAULT_PARQUET),
             artifact_root: None,
             ollama_host: DEFAULT_OLLAMA_HOST.to_string(),
             embed_host: DEFAULT_EMBED_HOST.to_string(),
@@ -170,6 +213,16 @@ impl Default for Config {
             embed_batch: DEFAULT_EMBED_BATCH,
             embed_lookahead: 0,
             embed_verify_model: DEFAULT_EMBED_VERIFY_MODEL,
+            solr_url: None,
+            solr_query: DEFAULT_SOLR_QUERY.to_string(),
+            solr_page_rows: DEFAULT_SOLR_PAGE_ROWS,
+            solr_modified_field: DEFAULT_SOLR_MODIFIED_FIELD.to_string(),
+            store_raw_artifacts: false,
+            raw_file_bytes: DEFAULT_RAW_FILE_BYTES,
+            s3_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            s3_prefix: None,
         }
     }
 }
