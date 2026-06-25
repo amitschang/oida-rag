@@ -33,6 +33,7 @@ arrow = "58"
 lance-index = "=7.0.0"
 object_store = { version = "0.13", features = ["aws"] }
 futures = "0.3"
+indicatif = "0.18"
 rmcp = "1"
 reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }

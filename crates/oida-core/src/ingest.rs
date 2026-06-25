@@ -43,10 +43,12 @@
 
 use anyhow::{Context, Result, bail};
 use arrow::array::RecordBatch;
+use indicatif::{ProgressBar, ProgressStyle};
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::{Connection, Table};
+use std::io::IsTerminal;
 
 use crate::config::Config;
 use crate::index::{ARTIFACTS_TABLE, DOCUMENTS_TABLE, write_watermark};
@@ -140,6 +142,18 @@ pub async fn ingest_from_solr(
     let mut arts = TableWriter::new(&db, ARTIFACTS_TABLE, config.ingest_buffer_bytes);
 
     tracing::info!("ingesting documents and artifacts from solr (streaming)...");
+    // On a TTY render a live progress bar; off a TTY indicatif hides it, so the
+    // periodic `tracing` lines below keep pod logs informative.
+    let tty = std::io::stderr().is_terminal();
+    let bar = ProgressBar::new(page.num_found);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{prefix:<9} {bar:28.yellow/blue} {pos:>9}/{len:>9} docs │ {per_sec}",
+        )
+        .expect("valid template")
+        .progress_chars("=>-"),
+    );
+    bar.set_prefix("documents");
     let mut cursor = CURSOR_START.to_string();
     let mut scanned: u64 = 0;
     let mut watermark: Option<String> = None;
@@ -161,7 +175,11 @@ pub async fn ingest_from_solr(
         )?)
         .await?;
         arts.push(solr_map::artifacts_batch(&page.docs)?).await?;
-        tracing::info!("scanned {scanned}/{} documents", page.num_found);
+        bar.set_length(page.num_found);
+        bar.set_position(scanned);
+        if !tty {
+            tracing::info!("scanned {scanned}/{} documents", page.num_found);
+        }
 
         if page.next_cursor.is_empty() || page.next_cursor == cursor {
             break;
@@ -171,6 +189,7 @@ pub async fn ingest_from_solr(
             .scan_page(since, &cursor, solr_map::SOURCE_FIELDS)
             .await?;
     }
+    bar.finish();
 
     let documents = docs.finish().await?;
     let artifacts = arts.finish().await?;

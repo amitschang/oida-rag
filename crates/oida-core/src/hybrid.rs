@@ -21,7 +21,7 @@
 //! pin: encode any weights change (a commit hash, a quantization tag) into it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +32,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use futures::{StreamExt, TryStreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::arrow::SendableRecordBatchStream;
@@ -856,12 +857,18 @@ pub(crate) async fn run_ticker(
         tokio::time::interval(Duration::from_millis(if tty { 500 } else { 5000 }));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // On a TTY render each pass on its own bar inside a shared MultiProgress; off
+    // a TTY indicatif hides the bars, so the single-line `tracing` log below
+    // keeps pod logs informative. The raw bar is only present for a concurrent
+    // raw + full-text build.
+    let bars = tty.then(|| TickerBars::new(raw.is_some()));
+
     let initial_chunks = progress.chunks.load(Ordering::Relaxed);
     // Set on the first tick that observes new chunks — the throughput clock.
     let mut run_start: Option<Instant> = None;
-    // Recent (timestamp, chunks, bytes) samples within the window, for the
-    // sliding-window rate.
-    let mut samples: VecDeque<(Instant, u64, u64)> = VecDeque::new();
+    // Recent (timestamp, chunks, text bytes, raw bytes) samples within the
+    // window, for the sliding-window rates.
+    let mut samples: VecDeque<(Instant, u64, u64, u64)> = VecDeque::new();
 
     loop {
         let stopping = tokio::select! {
@@ -879,23 +886,38 @@ pub(crate) async fn run_ticker(
         let embeds_inflight = progress.embeds_inflight.load(Ordering::Relaxed);
         let out_queued = progress.out_queued.load(Ordering::Relaxed);
 
+        // Sample the raw-download counters once when a concurrent raw pass is
+        // running; used by both render paths.
+        let raw_vals = raw.as_ref().map(|raw| RawVals {
+            stored: raw.stored.load(Ordering::Relaxed),
+            total: raw.total.load(Ordering::Relaxed),
+            inflight: raw.inflight.load(Ordering::Relaxed),
+            bytes: raw.bytes.load(Ordering::Relaxed),
+            missing: raw.missing.load(Ordering::Relaxed),
+        });
+        let raw_bytes = raw_vals.as_ref().map_or(0, |v| v.bytes);
+
         if run_start.is_none() && chunks > initial_chunks {
             run_start = Some(now);
         }
 
-        // Sliding-window rate: compare now against the oldest sample still inside
-        // the window. This smooths over the bursts that make a per-tick delta read
-        // zero most of the time.
-        samples.push_back((now, chunks, bytes));
-        while matches!(samples.front(), Some(&(t, _, _)) if now.duration_since(t) > RATE_WINDOW) {
+        // Sliding-window rates: compare now against the oldest sample still
+        // inside the window. This smooths over the bursts that make a per-tick
+        // delta read zero most of the time.
+        samples.push_back((now, chunks, bytes, raw_bytes));
+        while matches!(samples.front(), Some(&(t, ..)) if now.duration_since(t) > RATE_WINDOW) {
             samples.pop_front();
         }
-        let (recent_cps, recent_bps) = match samples.front() {
-            Some(&(t0, c0, b0)) if now > t0 => {
+        let (recent_cps, recent_bps, recent_raw_bps) = match samples.front() {
+            Some(&(t0, c0, b0, rb0)) if now > t0 => {
                 let dt = now.duration_since(t0).as_secs_f64();
-                ((chunks - c0) as f64 / dt, (bytes - b0) as f64 / dt)
+                (
+                    (chunks - c0) as f64 / dt,
+                    (bytes - b0) as f64 / dt,
+                    (raw_bytes - rb0) as f64 / dt,
+                )
             }
-            _ => (0.0, 0.0),
+            _ => (0.0, 0.0, 0.0),
         };
         // Cumulative average, measured from the first embedded chunk.
         let avg_cps = run_start.map_or(0.0, |rs| {
@@ -904,42 +926,62 @@ pub(crate) async fn run_ticker(
         // ~4 bytes per token is a rough English heuristic; labelled an estimate.
         let recent_tps = recent_bps / 4.0;
 
-        let line = format!(
-            "{chunks} chunks | 1m: {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tok/s | \
-             avg: {avg_cps:.0} ch/s | pipe: rd {reads_inflight} \u{2192} q {jobs_queued} \u{2192} \
-             emb {embeds_inflight} \u{2192} q {out_queued} | {scanned}/{total_artifacts} scanned | \
-             {missing} missing",
-            recent_bps / 1.0e6,
-            human_count(recent_tps as u64),
-        );
-        // Prefix the raw-download segment when running concurrently, so both
-        // passes share a single status line.
-        let line = match &raw {
-            Some(raw) => {
-                let stored = raw.stored.load(Ordering::Relaxed);
-                let total = raw.total.load(Ordering::Relaxed);
-                let inflight = raw.inflight.load(Ordering::Relaxed);
-                let raw_bytes = raw.bytes.load(Ordering::Relaxed);
-                let raw_missing = raw.missing.load(Ordering::Relaxed);
-                format!(
-                    "raw: {stored}/{total} files, {} dl, {inflight} active, {raw_missing} missing \
-                     || {line}",
-                    human_bytes(raw_bytes),
-                )
+        match &bars {
+            // TTY: drive the live progress bars.
+            Some(bars) => {
+                bars.text.set_length(total_artifacts);
+                bars.text.set_position(scanned);
+                bars.text.set_message(format!(
+                    "{chunks} chk │ 1m {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tk/s │ \
+                     av {avg_cps:.0} chk/s │ r {reads_inflight}\u{2192}q {jobs_queued}\
+                     \u{2192}e {embeds_inflight}\u{2192}q {out_queued} │ {missing} msng",
+                    recent_bps / 1.0e6,
+                    human_count(recent_tps as u64),
+                ));
+                if let (Some(raw_bar), Some(v)) = (&bars.raw, &raw_vals) {
+                    raw_bar.set_length(v.total);
+                    raw_bar.set_position(v.stored);
+                    raw_bar.set_message(format!(
+                        "{} dl │ {:.1} MB/s │ {} act │ {} msng",
+                        human_bytes(v.bytes),
+                        recent_raw_bps / 1.0e6,
+                        v.inflight,
+                        v.missing,
+                    ));
+                }
             }
-            None => line,
-        };
-        if tty {
-            // \r returns to column 0; \x1b[K clears the rest of the line.
-            eprint!("\r\x1b[K{line}");
-            let _ = std::io::stderr().flush();
-        } else {
-            tracing::info!("{line}");
+            // Non-TTY: emit the combined single line as a periodic log.
+            None => {
+                let line = format!(
+                    "{chunks} chunks | 1m: {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tok/s | \
+                     avg: {avg_cps:.0} ch/s | pipe: rd {reads_inflight} \u{2192} q {jobs_queued} \
+                     \u{2192} emb {embeds_inflight} \u{2192} q {out_queued} | \
+                     {scanned}/{total_artifacts} scanned | {missing} missing",
+                    recent_bps / 1.0e6,
+                    human_count(recent_tps as u64),
+                );
+                let line = match &raw_vals {
+                    Some(v) => format!(
+                        "raw: {}/{} files, {} dl, {:.1} MB/s, {} active, {} missing || {line}",
+                        v.stored,
+                        v.total,
+                        human_bytes(v.bytes),
+                        recent_raw_bps / 1.0e6,
+                        v.inflight,
+                        v.missing,
+                    ),
+                    None => line,
+                };
+                tracing::info!("{line}");
+            }
         }
 
         if stopping {
-            if tty {
-                eprintln!();
+            if let Some(bars) = &bars {
+                if let Some(raw_bar) = &bars.raw {
+                    raw_bar.finish();
+                }
+                bars.text.finish();
             }
             let embedded = chunks - initial_chunks;
             let secs = run_start.map_or(0.0, |rs| now.duration_since(rs).as_secs_f64());
@@ -948,6 +990,59 @@ pub(crate) async fn run_ticker(
                 embedded as f64 / secs.max(1e-6),
             );
             break;
+        }
+    }
+}
+
+/// A snapshot of the raw-download counters, sampled once per tick and shared by
+/// the bar and log render paths.
+struct RawVals {
+    stored: u64,
+    total: u64,
+    inflight: u64,
+    bytes: u64,
+    missing: u64,
+}
+
+/// The live progress bars driven by [`run_ticker`] on a TTY: a full-text bar and,
+/// for a concurrent raw + full-text build, a raw-download bar above it. Held in a
+/// [`MultiProgress`] so both redraw together without clobbering each other.
+struct TickerBars {
+    _multi: MultiProgress,
+    raw: Option<ProgressBar>,
+    text: ProgressBar,
+}
+
+impl TickerBars {
+    /// Build the bar set, adding a raw-download bar above the full-text bar when
+    /// `with_raw` is set.
+    fn new(with_raw: bool) -> Self {
+        let multi = MultiProgress::new();
+        let raw = with_raw.then(|| {
+            let bar = multi.add(ProgressBar::new(0));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{prefix:<9} {bar:28.green/blue} {pos:>9}/{len:>9} files\n    {msg}",
+                )
+                .expect("valid template")
+                .progress_chars("=>-"),
+            );
+            bar.set_prefix("raw");
+            bar
+        });
+        let text = multi.add(ProgressBar::new(0));
+        text.set_style(
+            ProgressStyle::with_template(
+                "{prefix:<9} {bar:28.cyan/blue} {pos:>9}/{len:>9} arts\n    {msg}",
+            )
+            .expect("valid template")
+            .progress_chars("=>-"),
+        );
+        text.set_prefix("full-text");
+        Self {
+            _multi: multi,
+            raw,
+            text,
         }
     }
 }
