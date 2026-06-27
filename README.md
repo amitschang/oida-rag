@@ -82,15 +82,15 @@ cargo build --release
 # (Optional) configure
 cp oida.toml.example oida.toml   # then edit
 
-# Ingest the parquet into LanceDB once (required before chatting). Add
+# Build the metadata index from Solr once (required before chatting). Add
 # --full-text to also build the hybrid semantic index over the OCR artifacts.
-cargo run --release -p oida-cli -- ingest
+cargo run --release -p oida-cli -- ingest --force
 
 # Chat interactively (the CLI spawns the server for you)
-cargo run --release -p oida-cli
+cargo run --release -p oida-cli -- chat
 
 # Or ask a single question and exit
-cargo run --release -p oida-cli -- --once "Find weekly retail reports and give me a document id and Bates number."
+cargo run --release -p oida-cli -- chat --once "Find weekly retail reports and give me a document id and Bates number."
 ```
 
 REPL commands: `/reset` clears the conversation, `/exit` (or Ctrl-D) quits.
@@ -103,7 +103,7 @@ artifact files on disk:
 
 ```sh
 ollama pull nomic-embed-text                       # default embedding model
-cargo run --release -p oida-cli -- ingest --full-text   # ingest + build the index
+cargo run --release -p oida-cli -- ingest --force --full-text   # build metadata + the index
 cargo run --release -p oida-cli -- stats                # inspect it
 ```
 

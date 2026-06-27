@@ -274,10 +274,10 @@ impl OidaServer {
         (all Utf8), artifact_count (Int64), and list columns custodian, authors, recipients, cc, \
         attachments, related, mentions, artifact_types (all List<Utf8> -- use UNNEST to group by \
         their elements). `artifacts` columns: id, name, media_type, md5 (Utf8), size (Int64). \
-        Only SELECT/WITH/DESCRIBE/EXPLAIN/SHOW are allowed; writes, DDL and multiple statements \
-        are rejected. Returns columns and JSON-valued rows (lists become arrays); on a bad query \
-        the `error` field explains why so you can fix and retry. Call describe_schema for the \
-        full column list."
+        Only SELECT/WITH/EXPLAIN/SHOW are allowed; writes, DDL and multiple statements \
+        are rejected. Returns columns and JSON-object rows keyed by column name (lists become \
+        arrays); on a bad query the `error` field explains why so you can fix and retry. Call \
+        describe_schema for the full column list."
     )]
     async fn run_sql(
         &self,

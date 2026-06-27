@@ -20,11 +20,10 @@
 //! is no portable content digest across embed servers, so the model name is the
 //! pin: encode any weights change (a commit hash, a quantization tag) into it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::IsTerminal;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -32,7 +31,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use futures::{StreamExt, TryStreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::arrow::SendableRecordBatchStream;
@@ -48,6 +46,7 @@ use crate::config::{Config, DEFAULT_EMBED_LOOKAHEAD_FACTOR};
 use crate::embed::Embedder;
 use crate::index::{Index, text_refs_from_batch};
 use crate::ingest::connect;
+use crate::progress::{FullTextProgress, run_ticker};
 use crate::source::ArtifactSource;
 
 /// Name of the table holding text chunks and their embeddings.
@@ -57,43 +56,6 @@ const META_TABLE: &str = "_meta";
 /// Below this row count a vector (ANN) index is skipped; flat search is exact
 /// and fast enough, and IVF/PQ training needs a reasonable number of rows.
 const MIN_VECTOR_INDEX_ROWS: usize = 256;
-
-/// Live build counters, updated lock-free by the pipeline stages and sampled by
-/// the progress ticker. Decoupling counting (hot path) from rendering (timer)
-/// keeps display cadence independent of work cadence.
-#[derive(Default)]
-pub(crate) struct Progress {
-    /// Artifacts the reader has walked (whether read, skipped, or missing).
-    scanned: AtomicU64,
-    /// Total text artifacts to index, the progress denominator (0 until the
-    /// reader has been handed the artifact list).
-    text_total: AtomicU64,
-    /// Chunks embedded so far (includes any seeded from a resume).
-    chunks: AtomicU64,
-    /// Bytes of chunk text embedded so far, for a throughput/token estimate.
-    text_bytes: AtomicU64,
-    /// Referenced artifact files that were not on disk.
-    missing: AtomicU64,
-    /// Live pipeline gauges — instantaneous depths, not cumulative totals — to
-    /// locate the bottleneck. The stage where work piles up is downstream of the
-    /// stall; the stage that runs below its limit is being starved by it.
-    ///
-    /// Read tasks currently executing on the blocking pool. Pinned near
-    /// `read_concurrency` when reads keep up; collapsing toward 1 despite a high
-    /// limit is the signature of head-of-line blocking in the order-preserving
-    /// reader (one slow artifact stalls every read queued behind it).
-    reads_inflight: AtomicU64,
-    /// Read+chunked jobs waiting in the channel for a free embed slot. Near the
-    /// channel cap ⇒ the embedder is the bottleneck; near 0 ⇒ the reader can't
-    /// keep the embedder fed.
-    jobs_queued: AtomicU64,
-    /// Embed requests in flight to the backend. Pinned near `embed_concurrency`
-    /// ⇒ the GPUs are saturated; below it ⇒ the embedder is starved upstream.
-    embeds_inflight: AtomicU64,
-    /// Embedded batches waiting in the channel for the writer. Near the channel
-    /// cap ⇒ LanceDB write backpressure is the bottleneck.
-    out_queued: AtomicU64,
-}
 
 /// A single fused chunk hit, before hydration into a full document.
 #[derive(Debug, Clone)]
@@ -285,11 +247,11 @@ pub async fn build(
     // Standalone build owns its own progress and ticker. The concurrent
     // orchestrator instead drives `build_with_progress` with a shared ticker so
     // raw storage and the text build render on one status line.
-    let progress = Arc::new(Progress::default());
+    let progress = Arc::new(FullTextProgress::default());
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let ticker = {
         let progress = progress.clone();
-        tokio::spawn(run_ticker(progress, None, stop_rx))
+        tokio::spawn(run_ticker(Some(progress), None, stop_rx))
     };
     let result = build_with_progress(config, index, embedder, force, resume, progress).await;
     let _ = stop_tx.send(());
@@ -308,7 +270,7 @@ pub(crate) async fn build_with_progress(
     embedder: &Embedder,
     force: bool,
     resume: bool,
-    progress: Arc<Progress>,
+    progress: Arc<FullTextProgress>,
 ) -> Result<IndexStats> {
     if force && resume {
         bail!("force and resume are mutually exclusive");
@@ -633,7 +595,7 @@ async fn run_reader(
     source: Arc<ArtifactSource>,
     mut artifacts: SendableRecordBatchStream,
     done: HashSet<String>,
-    progress: &Progress,
+    progress: &FullTextProgress,
     jobs_tx: mpsc::Sender<Vec<ChunkRow>>,
 ) -> ReaderStats {
     let read_concurrency = config.read_concurrency.max(1);
@@ -762,7 +724,7 @@ async fn run_embedder(
     prior_chunks: u64,
     concurrency: usize,
     lookahead: usize,
-    progress: &Progress,
+    progress: &FullTextProgress,
 ) -> Result<(Option<usize>, u64)> {
     // Caps concurrent embed requests independently of the ordered window above.
     let in_flight = Arc::new(Semaphore::new(concurrency));
@@ -832,249 +794,6 @@ async fn embed_job(embedder: &Embedder, rows: &[ChunkRow]) -> Result<(RecordBatc
     Ok((batch, d))
 }
 
-/// How far back the sliding-window ("recent") rate looks.
-const RATE_WINDOW: Duration = Duration::from_secs(60);
-
-/// Progress ticker: every interval, sample the shared counters and render a
-/// throughput line carrying two rates — a sliding-window "recent" rate (last
-/// [`RATE_WINDOW`]) and a cumulative average. A per-tick instantaneous rate is
-/// avoided because batches complete in bursts, so most ticks would read zero.
-///
-/// Throughput is measured from the first *embedded* chunk, so a resume's
-/// skip/scan phase (which produces no chunks) never enters the rate. On a TTY
-/// it rewrites one line in place; off a TTY (pod logs, pipes) it emits a
-/// periodic newline log. Stops when `stop` fires, printing a final summary.
-///
-/// When `raw` is supplied (the concurrent raw + full-text build) the line is
-/// prefixed with a raw-download segment so both passes share one status line.
-pub(crate) async fn run_ticker(
-    progress: Arc<Progress>,
-    raw: Option<Arc<crate::raw::RawProgress>>,
-    mut stop: oneshot::Receiver<()>,
-) {
-    let tty = std::io::stderr().is_terminal();
-    let mut interval =
-        tokio::time::interval(Duration::from_millis(if tty { 500 } else { 5000 }));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // On a TTY render each pass on its own bar inside a shared MultiProgress; off
-    // a TTY indicatif hides the bars, so the single-line `tracing` log below
-    // keeps pod logs informative. The raw bar is only present for a concurrent
-    // raw + full-text build.
-    let bars = tty.then(|| TickerBars::new(raw.is_some()));
-
-    let initial_chunks = progress.chunks.load(Ordering::Relaxed);
-    // Set on the first tick that observes new chunks — the throughput clock.
-    let mut run_start: Option<Instant> = None;
-    // Recent (timestamp, chunks, text bytes, raw bytes) samples within the
-    // window, for the sliding-window rates.
-    let mut samples: VecDeque<(Instant, u64, u64, u64)> = VecDeque::new();
-
-    loop {
-        let stopping = tokio::select! {
-            _ = interval.tick() => false,
-            _ = &mut stop => true,
-        };
-        let now = Instant::now();
-        let chunks = progress.chunks.load(Ordering::Relaxed);
-        let bytes = progress.text_bytes.load(Ordering::Relaxed);
-        let scanned = progress.scanned.load(Ordering::Relaxed);
-        let missing = progress.missing.load(Ordering::Relaxed);
-        let total_artifacts = progress.text_total.load(Ordering::Relaxed);
-        let reads_inflight = progress.reads_inflight.load(Ordering::Relaxed);
-        let jobs_queued = progress.jobs_queued.load(Ordering::Relaxed);
-        let embeds_inflight = progress.embeds_inflight.load(Ordering::Relaxed);
-        let out_queued = progress.out_queued.load(Ordering::Relaxed);
-
-        // Sample the raw-download counters once when a concurrent raw pass is
-        // running; used by both render paths.
-        let raw_vals = raw.as_ref().map(|raw| RawVals {
-            stored: raw.stored.load(Ordering::Relaxed),
-            total: raw.total.load(Ordering::Relaxed),
-            inflight: raw.inflight.load(Ordering::Relaxed),
-            bytes: raw.bytes.load(Ordering::Relaxed),
-            missing: raw.missing.load(Ordering::Relaxed),
-        });
-        let raw_bytes = raw_vals.as_ref().map_or(0, |v| v.bytes);
-
-        if run_start.is_none() && chunks > initial_chunks {
-            run_start = Some(now);
-        }
-
-        // Sliding-window rates: compare now against the oldest sample still
-        // inside the window. This smooths over the bursts that make a per-tick
-        // delta read zero most of the time.
-        samples.push_back((now, chunks, bytes, raw_bytes));
-        while matches!(samples.front(), Some(&(t, ..)) if now.duration_since(t) > RATE_WINDOW) {
-            samples.pop_front();
-        }
-        let (recent_cps, recent_bps, recent_raw_bps) = match samples.front() {
-            Some(&(t0, c0, b0, rb0)) if now > t0 => {
-                let dt = now.duration_since(t0).as_secs_f64();
-                (
-                    (chunks - c0) as f64 / dt,
-                    (bytes - b0) as f64 / dt,
-                    (raw_bytes - rb0) as f64 / dt,
-                )
-            }
-            _ => (0.0, 0.0, 0.0),
-        };
-        // Cumulative average, measured from the first embedded chunk.
-        let avg_cps = run_start.map_or(0.0, |rs| {
-            (chunks - initial_chunks) as f64 / now.duration_since(rs).as_secs_f64().max(1e-6)
-        });
-        // ~4 bytes per token is a rough English heuristic; labelled an estimate.
-        let recent_tps = recent_bps / 4.0;
-
-        match &bars {
-            // TTY: drive the live progress bars.
-            Some(bars) => {
-                bars.text.set_length(total_artifacts);
-                bars.text.set_position(scanned);
-                bars.text.set_message(format!(
-                    "{chunks} chk │ 1m {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tk/s │ \
-                     av {avg_cps:.0} chk/s │ r {reads_inflight}\u{2192}q {jobs_queued}\
-                     \u{2192}e {embeds_inflight}\u{2192}q {out_queued} │ {missing} msng",
-                    recent_bps / 1.0e6,
-                    human_count(recent_tps as u64),
-                ));
-                if let (Some(raw_bar), Some(v)) = (&bars.raw, &raw_vals) {
-                    raw_bar.set_length(v.total);
-                    raw_bar.set_position(v.stored);
-                    raw_bar.set_message(format!(
-                        "{} dl │ {:.1} MB/s │ {} act │ {} msng",
-                        human_bytes(v.bytes),
-                        recent_raw_bps / 1.0e6,
-                        v.inflight,
-                        v.missing,
-                    ));
-                }
-            }
-            // Non-TTY: emit the combined single line as a periodic log.
-            None => {
-                let line = format!(
-                    "{chunks} chunks | 1m: {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tok/s | \
-                     avg: {avg_cps:.0} ch/s | pipe: rd {reads_inflight} \u{2192} q {jobs_queued} \
-                     \u{2192} emb {embeds_inflight} \u{2192} q {out_queued} | \
-                     {scanned}/{total_artifacts} scanned | {missing} missing",
-                    recent_bps / 1.0e6,
-                    human_count(recent_tps as u64),
-                );
-                let line = match &raw_vals {
-                    Some(v) => format!(
-                        "raw: {}/{} files, {} dl, {:.1} MB/s, {} active, {} missing || {line}",
-                        v.stored,
-                        v.total,
-                        human_bytes(v.bytes),
-                        recent_raw_bps / 1.0e6,
-                        v.inflight,
-                        v.missing,
-                    ),
-                    None => line,
-                };
-                tracing::info!("{line}");
-            }
-        }
-
-        if stopping {
-            if let Some(bars) = &bars {
-                if let Some(raw_bar) = &bars.raw {
-                    raw_bar.finish();
-                }
-                bars.text.finish();
-            }
-            let embedded = chunks - initial_chunks;
-            let secs = run_start.map_or(0.0, |rs| now.duration_since(rs).as_secs_f64());
-            tracing::info!(
-                "embedding throughput: {embedded} chunks in {secs:.0}s ({:.0} chunks/s avg)",
-                embedded as f64 / secs.max(1e-6),
-            );
-            break;
-        }
-    }
-}
-
-/// A snapshot of the raw-download counters, sampled once per tick and shared by
-/// the bar and log render paths.
-struct RawVals {
-    stored: u64,
-    total: u64,
-    inflight: u64,
-    bytes: u64,
-    missing: u64,
-}
-
-/// The live progress bars driven by [`run_ticker`] on a TTY: a full-text bar and,
-/// for a concurrent raw + full-text build, a raw-download bar above it. Held in a
-/// [`MultiProgress`] so both redraw together without clobbering each other.
-struct TickerBars {
-    _multi: MultiProgress,
-    raw: Option<ProgressBar>,
-    text: ProgressBar,
-}
-
-impl TickerBars {
-    /// Build the bar set, adding a raw-download bar above the full-text bar when
-    /// `with_raw` is set.
-    fn new(with_raw: bool) -> Self {
-        let multi = MultiProgress::new();
-        let raw = with_raw.then(|| {
-            let bar = multi.add(ProgressBar::new(0));
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "{prefix:<9} {bar:28.green/blue} {pos:>9}/{len:>9} files\n    {msg}",
-                )
-                .expect("valid template")
-                .progress_chars("=>-"),
-            );
-            bar.set_prefix("raw");
-            bar
-        });
-        let text = multi.add(ProgressBar::new(0));
-        text.set_style(
-            ProgressStyle::with_template(
-                "{prefix:<9} {bar:28.cyan/blue} {pos:>9}/{len:>9} arts\n    {msg}",
-            )
-            .expect("valid template")
-            .progress_chars("=>-"),
-        );
-        text.set_prefix("full-text");
-        Self {
-            _multi: multi,
-            raw,
-            text,
-        }
-    }
-}
-
-/// Format a count compactly with a K/M suffix (for the high-magnitude tok/s).
-fn human_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1.0e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1.0e3)
-    } else {
-        n.to_string()
-    }
-}
-
-/// Format a byte count with a binary (1024) unit suffix, for the raw-download
-/// segment of the shared progress line.
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 /// Writer stage: accumulate embedded batches (already in document order) and
 /// flush them to LanceDB. A flush writes every *complete* document and carries
 /// the still-open trailing document forward, so a durable fragment never splits
@@ -1085,7 +804,7 @@ async fn run_writer(
     mut table: Option<Table>,
     mut out_rx: mpsc::Receiver<RecordBatch>,
     threshold: usize,
-    progress: &Progress,
+    progress: &FullTextProgress,
 ) -> Result<Option<Table>> {
     let mut buffer: Vec<RecordBatch> = Vec::new();
     let mut buffer_bytes: usize = 0;

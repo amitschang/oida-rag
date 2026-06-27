@@ -4,7 +4,7 @@
 //! full-text/OCR reader — fetch bytes through this single abstraction so they
 //! work identically against a local `artifact_root` or a remote S3 bucket. The
 //! key layout is the same fan-out the on-disk store uses
-//! (`<prefix>/m/s/k/f/<stem>/<name>`), so the same corpus can live in either
+//! (`<prefix>/m/s/k/f/<id>/<name>`), so the same corpus can live in either
 //! backend without re-keying.
 //!
 //! Backed by [`object_store`] (already in the dependency tree via `lance`),
@@ -24,7 +24,7 @@ use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
 use crate::config::Config;
 
 /// A source of artifact bytes: a local directory or an S3 bucket, both sharing
-/// the fan-out key layout `<prefix>/m/s/k/f/<stem>/<name>`.
+/// the fan-out key layout `<prefix>/m/s/k/f/<id>/<name>`.
 pub struct ArtifactSource {
     store: Arc<dyn ObjectStore>,
     /// Key prefix prepended to every artifact path (empty for a bare local root).
@@ -79,11 +79,8 @@ impl ArtifactSource {
     /// directory, then the full `id`, then the file `name` (mirrors the
     /// archive's on-disk layout `i/d/x/x/idxx…/<name>`).
     ///
-    /// The directory is the document `id`, not a stem parsed from `name`,
-    /// because every file of a document — the original, its OCR text, and
-    /// derived files like `<id>_thumb.png` — lives together under the id
-    /// directory. Deriving the directory from the file name instead would send
-    /// `<id>_thumb.png` to a non-existent `<id>_thumb/` directory.
+    /// All of a document's files — the original, its OCR text, and derived
+    /// files like `<id>_thumb.png` — share the one `<id>` directory.
     fn key(&self, id: &str, name: &str) -> ObjectPath {
         let mut raw = String::new();
         if !self.prefix.is_empty() {
@@ -139,8 +136,7 @@ mod tests {
             source.key_display("mskf0352", "mskf0352.ocr"),
             "artifacts/m/s/k/f/mskf0352/mskf0352.ocr"
         );
-        // Derived files (e.g. thumbnails) live under the document id directory,
-        // not a directory named after the file stem.
+        // Derived files (e.g. thumbnails) live under the document id directory.
         assert_eq!(
             source.key_display("mskf0352", "mskf0352_thumb.png"),
             "artifacts/m/s/k/f/mskf0352/mskf0352_thumb.png"

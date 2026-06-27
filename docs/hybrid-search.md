@@ -122,35 +122,37 @@ pass `--force`, which drops and rebuilds it from scratch.
   ```sh
   ollama pull nomic-embed-text
   ```
-- `artifact_root` configured and pointing at the on-disk artifact files (the
-  build needs the actual text, not just the metadata).
-- The metadata index already ingested (`oida-cli ingest`), since the full-text
-  build reads the artifact list from the LanceDB `artifacts` table. Running
-  `ingest --full-text` does both phases in one command.
+- `artifact_root` (or an S3 source) configured and pointing at the artifact
+  files (the build needs the actual text, not just the metadata).
+- The metadata index already built (`oida-cli ingest --force`), since the
+  full-text build reads the artifact list from the LanceDB `artifacts` table.
+  Passing `--full-text` to the same command builds both phases at once.
 
 ### Commands
 
-The hybrid index is built by the `ingest` subcommand's `--full-text` flag
-(interactive chat remains the default when no subcommand is given):
+The hybrid index is built by the `ingest` subcommand's `--full-text` flag. By
+default `ingest` performs an *incremental* update from the stored watermark and
+re-embeds only new/changed documents; pass `--force` to rebuild metadata and the
+index from scratch.
 
 ```sh
-# Ingest metadata AND build the hybrid index (fails if one already exists)
+# Fresh full build: rebuild metadata AND the hybrid index from a full Solr scan
+oida-cli ingest --force --full-text
+
+# Incremental: sync metadata, then re-embed only new/changed documents
 oida-cli ingest --full-text
 
-# Same, replacing any existing index
-oida-cli ingest --full-text --force
-
 # Build with a specific embedding model (global flag, overrides config)
-oida-cli ingest --full-text --embed-model mxbai-embed-large
+oida-cli ingest --force --full-text --embed-model mxbai-embed-large
 
 # Show statistics about the ingested index (metadata + hybrid, if built)
 oida-cli stats
 ```
 
-> The metadata ingest reuses the same `--force` flag; passing `--force` to
-> `ingest --full-text` re-ingests metadata and rebuilds the chunks index.
-> To (re)build only after metadata is already loaded, run a plain
-> `oida-cli ingest` first, then `oida-cli ingest --full-text`.
+> `--force` rebuilds both the metadata tables and the chunks index from a full
+> Solr scan. Without it, `ingest --full-text` updates metadata in place and
+> re-embeds only the documents that are new or changed since the last run, so it
+> can be re-run cheaply after the source archive changes.
 
 `stats` reports the document, artifact, and chunk counts, and — when the hybrid
 index is built — the embed model and its digest, the vector dimension, and the

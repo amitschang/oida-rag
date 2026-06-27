@@ -1,9 +1,9 @@
 //! LanceDB-backed access to the OIDA index.
 //!
-//! The 2.7 GB parquet has ~24M artifact-level rows. Ingest deduplicates them
-//! into a document-level `documents` table plus a thin `artifacts` table, both
-//! stored in a single embedded LanceDB database and indexed (scalar + FTS).
-//! All metadata queries run against that store. Text/vector search lives in the
+//! The Solr ingest maps the archive corpus (~24M artifacts) into a
+//! document-level `documents` table plus a thin `artifacts` table, both stored
+//! in a single embedded LanceDB database and indexed (scalar + FTS). All
+//! metadata queries run against that store. Text/vector search lives in the
 //! sibling [`crate::hybrid`] module against the same database.
 
 use std::sync::Arc;
@@ -210,9 +210,9 @@ impl Index {
     }
 
     /// Delete every chunk whose `doc_id` is in `doc_ids` from the hybrid text
-    /// index, so stale embedded text is never served. A later `ingest --resume`
-    /// re-embeds the affected documents. Returns the number of chunk rows
-    /// removed (0 if the chunks table does not exist yet).
+    /// index, so stale embedded text is never served. A later incremental
+    /// `ingest --full-text` re-embeds the affected documents. Returns the number
+    /// of chunk rows removed (0 if the chunks table does not exist yet).
     pub(crate) async fn delete_chunks_for(&self, doc_ids: &[String]) -> Result<u64> {
         if doc_ids.is_empty() {
             return Ok(0);
@@ -678,7 +678,7 @@ impl Index {
 
     /// Delete every raw-artifact row whose `id` (document id) is in `doc_ids`
     /// from the `raw_artifacts` table, so stale bytes for changed/redacted
-    /// documents are never returned. A later `ingest --resume --store-raw`
+    /// documents are never returned. A later incremental `ingest --store-raw`
     /// re-fetches the affected artifacts. Returns the number of rows removed
     /// (0 if the table does not exist yet).
     pub(crate) async fn delete_raw_for(&self, doc_ids: &[String]) -> Result<u64> {
@@ -778,7 +778,7 @@ pub(crate) fn sql_str(s: &str) -> String {
 
 /// True when `db` contains a table named `name`. Centralises the
 /// list-then-membership-test guard the existence-checked paths share.
-async fn has_table(db: &Connection, name: &str) -> Result<bool> {
+pub(crate) async fn has_table(db: &Connection, name: &str) -> Result<bool> {
     let names = db.table_names().execute().await.context("listing tables")?;
     Ok(names.iter().any(|n| n == name))
 }

@@ -17,9 +17,10 @@ use tokio::sync::oneshot;
 
 use crate::config::Config;
 use crate::embed::Embedder;
-use crate::hybrid::{self, IndexStats, Progress};
+use crate::hybrid::{self, IndexStats};
 use crate::index::Index;
-use crate::raw::{self, RawProgress, RawStats};
+use crate::progress::{FullTextProgress, RawProgress, run_ticker};
+use crate::raw::{self, RawStats};
 
 /// Build the raw-artifact store and the full-text index concurrently, sharing a
 /// single live status line.
@@ -35,12 +36,12 @@ pub async fn build_raw_and_text(
     force: bool,
     resume: bool,
 ) -> Result<(RawStats, IndexStats)> {
-    let progress = Arc::new(Progress::default());
+    let progress = Arc::new(FullTextProgress::default());
     let raw_progress = Arc::new(RawProgress::default());
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let ticker = tokio::spawn(hybrid::run_ticker(
-        progress.clone(),
+    let ticker = tokio::spawn(run_ticker(
+        Some(progress.clone()),
         Some(raw_progress.clone()),
         stop_rx,
     ));

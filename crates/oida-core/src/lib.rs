@@ -12,6 +12,7 @@ pub mod hybrid;
 pub mod index;
 pub mod ingest;
 pub mod model;
+pub mod progress;
 pub mod raw;
 pub mod search;
 pub mod solr;

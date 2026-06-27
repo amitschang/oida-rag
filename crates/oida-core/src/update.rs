@@ -90,7 +90,7 @@ pub struct ApplyStats {
     /// Chunk rows removed so stale embedded text is never served.
     pub chunks_invalidated: u64,
     /// Raw-artifact rows removed so stale bytes are never returned; a later
-    /// `ingest --resume --store-raw` re-fetches them.
+    /// incremental `ingest --store-raw` re-fetches them.
     pub raw_invalidated: u64,
     /// Solr pages fetched.
     pub pages: u64,
@@ -188,8 +188,8 @@ pub async fn sample_doc(config: &Config, since: Option<&str>) -> Result<Option<V
 /// - **new**/**changed** docs are upserted into `documents`/`artifacts`;
 /// - **redacted** docs are deleted;
 /// - the chunks of every **changed** or **redacted** doc are invalidated so
-///   stale embedded text is never served — a later `ingest --resume` re-embeds
-///   exactly the affected documents.
+///   stale embedded text is never served — a later incremental
+///   `ingest --full-text` re-embeds exactly the affected documents.
 ///
 /// Upserts run per page to bound memory; deletions and the watermark are
 /// applied after the full scan and the watermark is written last, so a crash

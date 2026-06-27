@@ -1,4 +1,4 @@
-//! Manual smoke test for the core index against the real parquet.
+//! Manual smoke test for the core index against the real Solr corpus.
 //! Run with: `cargo run -p oida-core --example smoke -- "search terms"`
 
 use oida_core::{Config, Index, SearchParams};

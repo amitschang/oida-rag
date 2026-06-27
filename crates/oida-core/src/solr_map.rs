@@ -1,15 +1,13 @@
 //! Mapping from raw Solr documents to LanceDB `documents`/`artifacts` batches.
 //!
-//! Solr is the single source of truth (the parquet route is retired), so this
-//! module owns the schema. Each Solr document becomes one `documents` row and
-//! its parsed `artifact` list becomes several `artifacts` rows. The only
-//! transform the old parquet scraper applied was flattening single-valued array
-//! fields (dates, `collection`, …) to scalars; we reproduce that robustly by
-//! accepting either a scalar or a one-element array for every scalar column,
-//! without needing to know which fields are arrays.
+//! Solr is the single source of truth, so this module owns the schema. Each
+//! Solr document becomes one `documents` row and its parsed `artifact` list
+//! becomes several `artifacts` rows. Single-valued array fields (dates,
+//! `collection`, …) are flattened to scalars by accepting either a scalar or a
+//! one-element array for every scalar column, without needing to know which
+//! fields are arrays.
 //!
-//! The produced schemas match the existing tables (so the serving path and the
-//! full-text build are unchanged) plus two new `documents` columns:
+//! The `documents` schema carries the searchable/metadata columns plus:
 //! - `ddmudate`: the document's modified-date watermark (max of the field).
 //! - `digest`: a stable fingerprint of the metadata + artifact md5 set, for
 //!   future metadata-change detection.
@@ -98,10 +96,9 @@ pub(crate) struct ArtifactMeta {
 
 /// Build the `documents` record batch for a slice of Solr documents.
 ///
-/// Column order mirrors the original ingest (scalars, then list columns, then
-/// the derived `artifact_types`/`artifact_count`/`search_text`) followed by the
-/// new `ddmudate` and `digest` columns. `modified_field` names the Solr
-/// watermark field (e.g. `ddmudate`).
+/// Columns are emitted in schema order: scalars, then list columns, then the
+/// derived `artifact_types`/`artifact_count`/`search_text`, then `ddmudate` and
+/// `digest`. `modified_field` names the Solr watermark field (e.g. `ddmudate`).
 pub(crate) fn documents_batch(docs: &[Value], modified_field: &str) -> Result<RecordBatch> {
     // Scalar builders, in SCALAR_COLS order with `title` inserted after `bn`.
     let mut id = StringBuilder::new();
@@ -154,7 +151,7 @@ pub(crate) fn documents_batch(docs: &[Value], modified_field: &str) -> Result<Re
         }
         artifact_types.append(true);
 
-        // Derived search text (same fields the FTS column has always covered).
+        // Derived search text: the fields the FTS `search_text` column covers.
         search_text.append_value(build_search_text(doc, title_val.as_deref()));
 
         // Watermark + digest.

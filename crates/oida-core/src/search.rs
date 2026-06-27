@@ -2,9 +2,8 @@
 //!
 //! Candidate documents are found with LanceDB's full-text (BM25) index over the
 //! concatenated `search_text` column, then scored and ranked in Rust by the
-//! number of distinct query terms they contain — preserving the original
-//! term-count ranking and per-field provenance. Matching is metadata-only;
-//! artifact OCR text is searched by [`crate::hybrid`].
+//! number of distinct query terms they contain, reporting per-field provenance.
+//! Matching is metadata-only; artifact OCR text is searched by [`crate::hybrid`].
 
 use crate::index::Index;
 use crate::model::{Document, SearchHit};

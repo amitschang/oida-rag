@@ -11,8 +11,8 @@ ollama_host = "http://localhost:11434"
 ollama_model = "qwen2.5-coder:latest"
 
 # LanceDB database directory. Holds the document/artifact metadata tables
-# (`oida-cli ingest`) and, when built, the hybrid keyword + semantic text index
-# over artifact OCR text (`oida-cli ingest --full-text`).
+# (`oida-cli ingest --force`) and, when built, the hybrid keyword + semantic
+# text index over artifact OCR text (`oida-cli ingest --force --full-text`).
 lance_path = "oida-lance"
 
 # Ollama model used to embed document text and queries for semantic search.
@@ -42,7 +42,7 @@ compact_on_build = true
 ingest_buffer_bytes = 536870912
 
 # Store raw (non-text) artifact bytes in a `raw_artifacts` blob table during
-# `oida-cli ingest` (also `--store-raw`). The bytes are fetched from the
+# `oida-cli ingest` (pass `--store-raw`). The bytes are fetched from the
 # artifact source below; the text/plain OCR chunk index is built regardless.
 # store_raw_artifacts = false
 

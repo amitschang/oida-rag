@@ -3,31 +3,31 @@
 //! [`Index::run_sql`] lets a caller run ad-hoc `SELECT`-style queries against
 //! the `documents`, `artifacts`, and (when present) `chunks` tables using
 //! DataFusion. The tables are exposed to a fresh, per-call [`SessionContext`]
-//! via Lance's [`LanceTableProvider`]; the context registers nothing else, so
+//! via LanceDB's [`BaseTableAdapter`]; the context registers nothing else, so
 //! there are no UDFs, catalogs, or filesystem sources reachable from the SQL.
 //! Safety rests on two layers:
 //!
 //! 1. The session context only knows about the read-only Lance tables. There
 //!    is no write path, no external file/network function, and no extension
 //!    loading reachable from a query.
-//! 2. [`validate_sql`] restricts queries to a single, read-only statement so
-//!    accidental or malformed input fails fast with a clear message.
+//! 2. [`validate_sql`] parses the input with DataFusion's SQL parser and
+//!    restricts queries to a single, read-only statement so accidental or
+//!    malformed input fails fast with a clear message.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{
-    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeListArray, LargeStringArray, ListArray, StringArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::DataType;
-use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow::array::RecordBatch;
+use arrow::json::WriterBuilder;
+use arrow::json::writer::JsonArray;
 use futures::TryStreamExt;
-use lance::datafusion::LanceTableProvider;
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::{DFParser, Statement as DfStatement};
+use datafusion::sql::sqlparser::ast::{Query, SetExpr, Statement as SqlStatement};
 use lancedb::Table;
+use lancedb::table::datafusion::BaseTableAdapter;
+use serde_json::value::RawValue;
 
 use crate::index::{ARTIFACTS_TABLE, DOCUMENTS_TABLE, Index};
 use crate::model::{ColumnInfo, SqlQueryResult, TableSchema};
@@ -35,79 +35,78 @@ use crate::model::{ColumnInfo, SqlQueryResult, TableSchema};
 /// Name of the optional full-text chunks table (created by `--full-text`).
 const CHUNKS_TABLE: &str = "chunks";
 
-/// Statement keywords permitted as the first token of a query. All are
-/// read-only; anything else (INSERT, UPDATE, DELETE, CREATE, DROP, COPY,
-/// INSERT INTO, ...) is rejected.
-const ALLOWED_LEADING_KEYWORDS: &[&str] =
-    &["select", "with", "describe", "explain", "show", "values"];
-
 /// Validate that `sql` is a single, read-only statement.
 ///
 /// Returns `Ok(())` when the query may run, or `Err(message)` describing why it
-/// was rejected. This is a syntactic guard layered on top of a context that
-/// only exposes the read-only Lance tables; it is intentionally conservative.
+/// was rejected. The query is parsed with DataFusion's own SQL parser so the
+/// check inspects the statement's AST rather than guessing from leading
+/// keywords; this is layered on top of a context that only exposes the
+/// read-only Lance tables, and is intentionally conservative.
 pub fn validate_sql(sql: &str) -> Result<(), String> {
-    let trimmed = sql.trim();
-    if trimmed.is_empty() {
+    if sql.trim().is_empty() {
         return Err("empty query".to_string());
     }
 
-    // Reject multiple statements. Allow a single optional trailing semicolon,
-    // but any other top-level `;` (outside string/identifier quotes) indicates
-    // more than one statement.
-    if has_multiple_statements(trimmed) {
-        return Err("only a single statement is allowed".to_string());
-    }
+    let statements =
+        DFParser::parse_sql(sql).map_err(|e| format!("could not parse query: {e}"))?;
 
-    // Check the leading keyword against the read-only allowlist.
-    let first = trimmed
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .find(|t| !t.is_empty())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !ALLOWED_LEADING_KEYWORDS.contains(&first.as_str()) {
-        return Err(format!(
-            "statement starting with `{first}` is not allowed; only read-only queries \
-             (SELECT, WITH, DESCRIBE, EXPLAIN, SHOW, VALUES) are permitted"
-        ));
-    }
+    let statement = match statements.len() {
+        0 => return Err("empty query".to_string()),
+        1 => &statements[0],
+        n => return Err(format!("only a single statement is allowed, found {n}")),
+    };
 
-    Ok(())
+    if is_read_only(statement) {
+        Ok(())
+    } else {
+        Err("statement is not allowed; only read-only queries \
+             (SELECT, WITH, DESCRIBE, EXPLAIN) are permitted"
+            .to_string())
+    }
 }
 
-/// True if `sql` contains more than one statement, ignoring a single optional
-/// trailing semicolon and any `;` inside single quotes, double quotes, or
-/// backtick-quoted identifiers.
-fn has_multiple_statements(sql: &str) -> bool {
-    let mut quote: Option<char> = None;
-    let mut chars = sql.char_indices().peekable();
-    while let Some((idx, c)) = chars.next() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    // Doubled quote is an escaped quote, not a terminator.
-                    if chars.peek().map(|&(_, n)| n) == Some(q) {
-                        chars.next();
-                    } else {
-                        quote = None;
-                    }
-                }
-            }
-            None => match c {
-                '\'' | '"' | '`' => quote = Some(c),
-                ';' => {
-                    // A semicolon is fine only if nothing but whitespace
-                    // follows it (a single trailing terminator).
-                    if sql[idx + 1..].trim().is_empty() {
-                        return false;
-                    }
-                    return true;
-                }
-                _ => {}
-            },
-        }
+/// True if `statement` cannot mutate data, schema, or session state.
+///
+/// `EXPLAIN` is unwrapped and its inner statement is checked, because
+/// `EXPLAIN ANALYZE` actually executes the wrapped statement.
+fn is_read_only(statement: &DfStatement) -> bool {
+    match statement {
+        DfStatement::Explain(explain) => is_read_only(&explain.statement),
+        DfStatement::Statement(inner) => is_read_only_sql(inner),
+        _ => false,
     }
-    false
+}
+
+/// True if a standard sqlparser statement is one of the read-only kinds we
+/// allow: queries and schema introspection (`DESCRIBE`, `SHOW TABLES`,
+/// `SHOW COLUMNS`).
+fn is_read_only_sql(statement: &SqlStatement) -> bool {
+    match statement {
+        // A query body can itself be a write (e.g. `WITH cte AS (..) INSERT
+        // ..` parses as a query whose body is an INSERT), so inspect it.
+        SqlStatement::Query(query) => query_is_read_only(query),
+        _ => false,
+    }
+}
+
+/// True if a `Query` (including any CTEs and set operations) only reads.
+fn query_is_read_only(query: &Query) -> bool {
+    set_expr_is_read_only(&query.body)
+}
+
+/// True if a query body contains no write/DML node.
+///
+/// `SELECT`, `VALUES`, and `TABLE` read; nested queries and set operations are
+/// checked recursively; `INSERT`/`UPDATE`/`DELETE`/`MERGE` bodies are writes.
+fn set_expr_is_read_only(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(query) => query_is_read_only(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_is_read_only(left) && set_expr_is_read_only(right)
+        }
+        _ => false,
+    }
 }
 
 impl Index {
@@ -139,29 +138,37 @@ impl Index {
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        let ncols = columns.len();
 
-        let mut out: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut row_count = 0usize;
         let mut truncated = false;
-        'outer: while let Some(batch) = stream.try_next().await.context("reading results")? {
-            for row in 0..batch.num_rows() {
-                if out.len() >= max_rows {
-                    truncated = true;
-                    break 'outer;
-                }
-                let mut record = Vec::with_capacity(ncols);
-                for col in 0..ncols {
-                    record.push(array_to_json(batch.column(col).as_ref(), row));
-                }
-                out.push(record);
+        while let Some(batch) = stream.try_next().await.context("reading results")? {
+            if batch.num_rows() == 0 {
+                continue;
             }
+            if row_count >= max_rows {
+                // The cap is already met but the stream still has rows.
+                truncated = true;
+                break;
+            }
+            // Trim the batch so the result never exceeds `max_rows`; dropping
+            // any rows means the result is truncated.
+            let remaining = max_rows - row_count;
+            let batch = if batch.num_rows() > remaining {
+                truncated = true;
+                batch.slice(0, remaining)
+            } else {
+                batch
+            };
+            row_count += batch.num_rows();
+            batches.push(batch);
         }
 
         Ok(SqlQueryResult {
             columns,
-            row_count: out.len(),
+            rows: batches_to_json(&batches)?,
+            row_count,
             truncated,
-            rows: out,
             error: None,
         })
     }
@@ -214,102 +221,51 @@ impl Index {
 
     /// Open the optional `chunks` table if the full-text index has been built.
     async fn open_chunks(&self) -> Result<Option<Table>> {
-        let names = self
-            .db
-            .table_names()
-            .execute()
-            .await
-            .context("listing tables")?;
-        if !names.iter().any(|n| n == CHUNKS_TABLE) {
-            return Ok(None);
+        if crate::index::has_table(&self.db, CHUNKS_TABLE).await? {
+            let table = self
+                .db
+                .open_table(CHUNKS_TABLE)
+                .execute()
+                .await
+                .context("opening chunks table")?;
+            Ok(Some(table))
+        } else {
+            Ok(None)
         }
-        let table = self
-            .db
-            .open_table(CHUNKS_TABLE)
-            .execute()
-            .await
-            .context("opening chunks table")?;
-        Ok(Some(table))
     }
 }
 
-/// Build a DataFusion table provider backed by a LanceDB table's dataset.
+/// Build a DataFusion table provider backed by a LanceDB table.
+///
+/// Uses LanceDB's [`BaseTableAdapter`] so scans go through LanceDB's query
+/// planner: `WHERE` filters are pushed down (and can hit scalar indices) and
+/// full-text predicates can use the FTS index.
 async fn lance_provider(table: &Table) -> Result<Arc<dyn TableProvider>> {
-    let dataset = table
-        .dataset()
-        .context("table has no backing dataset")?
-        .get()
+    let adapter = BaseTableAdapter::try_new(table.base_table().clone())
         .await
-        .context("loading dataset")?;
-    Ok(Arc::new(LanceTableProvider::new(dataset, false, false)))
+        .context("building table provider")?;
+    Ok(Arc::new(adapter))
 }
 
-/// Convert one cell of an Arrow array into a [`serde_json::Value`].
+/// Serialize the result batches into a single JSON array of row objects using
+/// Arrow's JSON writer.
 ///
-/// Scalars map to their JSON equivalents; list/array types become JSON arrays.
-/// Types without a natural JSON form fall back to a string rendering so a
-/// result is always serializable.
-fn array_to_json(array: &dyn Array, row: usize) -> serde_json::Value {
-    use serde_json::Value as J;
-    if array.is_null(row) {
-        return J::Null;
+/// Each row becomes an object keyed by column name (lists/structs become JSON
+/// arrays/objects). `explicit_nulls` keeps null cells in the output so every
+/// row carries the full set of columns. The bytes Arrow produces are wrapped in
+/// a [`RawValue`] so they pass through into the response verbatim, without being
+/// parsed into intermediate values and re-serialized.
+fn batches_to_json(batches: &[RecordBatch]) -> Result<Box<RawValue>> {
+    let mut writer = WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, JsonArray>(Vec::new());
+    for batch in batches {
+        writer.write(batch).context("serializing results to JSON")?;
     }
-    match array.data_type() {
-        DataType::Boolean => J::Bool(downcast::<BooleanArray>(array).value(row)),
-        DataType::Int8 => J::from(downcast::<Int8Array>(array).value(row)),
-        DataType::Int16 => J::from(downcast::<Int16Array>(array).value(row)),
-        DataType::Int32 => J::from(downcast::<Int32Array>(array).value(row)),
-        DataType::Int64 => J::from(downcast::<Int64Array>(array).value(row)),
-        DataType::UInt8 => J::from(downcast::<UInt8Array>(array).value(row)),
-        DataType::UInt16 => J::from(downcast::<UInt16Array>(array).value(row)),
-        DataType::UInt32 => J::from(downcast::<UInt32Array>(array).value(row)),
-        DataType::UInt64 => J::from(downcast::<UInt64Array>(array).value(row)),
-        DataType::Float32 => json_from_f64(downcast::<Float32Array>(array).value(row) as f64),
-        DataType::Float64 => json_from_f64(downcast::<Float64Array>(array).value(row)),
-        DataType::Utf8 => J::String(downcast::<StringArray>(array).value(row).to_string()),
-        DataType::LargeUtf8 => J::String(downcast::<LargeStringArray>(array).value(row).to_string()),
-        DataType::List(_) => list_to_json(downcast::<ListArray>(array).value(row).as_ref()),
-        DataType::LargeList(_) => {
-            list_to_json(downcast::<LargeListArray>(array).value(row).as_ref())
-        }
-        DataType::FixedSizeList(_, _) => {
-            list_to_json(downcast::<FixedSizeListArray>(array).value(row).as_ref())
-        }
-        // No lossless JSON form: render textually so output stays serializable.
-        _ => format_fallback(array, row),
-    }
-}
-
-/// Convert an entire (already-extracted) list element array into a JSON array.
-fn list_to_json(values: &dyn Array) -> serde_json::Value {
-    serde_json::Value::Array((0..values.len()).map(|i| array_to_json(values, i)).collect())
-}
-
-/// Render a cell as a string via Arrow's display formatter (fallback path).
-fn format_fallback(array: &dyn Array, row: usize) -> serde_json::Value {
-    match ArrayFormatter::try_new(array, &FormatOptions::default()) {
-        Ok(formatter) => serde_json::Value::String(formatter.value(row).to_string()),
-        Err(_) => serde_json::Value::Null,
-    }
-}
-
-/// Downcast an `&dyn Array` to a concrete array type, panicking on mismatch.
-///
-/// The caller has already matched on `array.data_type()`, so a mismatch is a
-/// programmer error rather than a runtime condition.
-fn downcast<T: 'static>(array: &dyn Array) -> &T {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .expect("array type matched its DataType")
-}
-
-/// Build a JSON number from an `f64`, falling back to `null` for non-finite
-/// values (JSON cannot represent NaN/Infinity).
-fn json_from_f64(n: f64) -> serde_json::Value {
-    serde_json::Number::from_f64(n)
-        .map(serde_json::Value::Number)
-        .unwrap_or(serde_json::Value::Null)
+    writer.finish().context("finishing JSON output")?;
+    let bytes = writer.into_inner();
+    let json = String::from_utf8(bytes).context("results were not valid UTF-8")?;
+    RawValue::from_string(json).context("wrapping JSON results")
 }
 
 #[cfg(test)]
@@ -321,8 +277,9 @@ mod tests {
         assert!(validate_sql("SELECT * FROM documents").is_ok());
         assert!(validate_sql("  select count(*) from artifacts  ").is_ok());
         assert!(validate_sql("WITH t AS (SELECT 1) SELECT * FROM t").is_ok());
-        assert!(validate_sql("DESCRIBE documents").is_ok());
         assert!(validate_sql("EXPLAIN SELECT 1").is_ok());
+        assert!(validate_sql("VALUES (1), (2)").is_ok());
+        assert!(validate_sql("SELECT 1 UNION ALL SELECT 2").is_ok());
         assert!(validate_sql("SELECT 1;").is_ok());
         assert!(validate_sql("(SELECT 1)").is_ok());
     }
@@ -335,6 +292,18 @@ mod tests {
         assert!(validate_sql("DROP TABLE documents").is_err());
         assert!(validate_sql("CREATE TABLE t (x INT)").is_err());
         assert!(validate_sql("COPY documents TO '/tmp/x.csv'").is_err());
+    }
+
+    #[test]
+    fn rejects_writes_hidden_in_a_query_body() {
+        // A leading `WITH` does not make a statement read-only: the query body
+        // can be an INSERT. The parser-based check looks past the keyword.
+        assert!(
+            validate_sql("WITH t AS (SELECT 1) INSERT INTO documents SELECT * FROM t").is_err()
+        );
+        // EXPLAIN ANALYZE executes its inner statement, so a write there is
+        // still rejected.
+        assert!(validate_sql("EXPLAIN ANALYZE COPY documents TO '/tmp/x.csv'").is_err());
     }
 
     #[test]
@@ -354,5 +323,11 @@ mod tests {
     fn rejects_empty() {
         assert!(validate_sql("").is_err());
         assert!(validate_sql("   ").is_err());
+    }
+
+    #[test]
+    fn rejects_unparseable_input() {
+        assert!(validate_sql("SELECT * FROM (").is_err());
+        assert!(validate_sql("not sql at all").is_err());
     }
 }

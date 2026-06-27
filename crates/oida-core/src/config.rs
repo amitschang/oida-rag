@@ -24,9 +24,10 @@ pub const DEFAULT_CHUNK_OVERLAP: usize = 256;
 /// hybrid index. Embedded chunk batches accumulate until they reach this size,
 /// then flush to LanceDB in a single `Table::add`. This decouples the (small)
 /// Ollama embed batch from the (large) Lance fragment, keeping fragment churn
-/// low. Each flush is also a durable checkpoint that `--resume` can restart
-/// from, so this is kept modest (128 MiB) to bound how much embedding work a
-/// crash can lose while still yielding healthy Lance fragments.
+/// low. Each flush is also a durable checkpoint that a re-run of an incremental
+/// `ingest --full-text` can restart from, so this is kept modest (128 MiB) to
+/// bound how much embedding work a crash can lose while still yielding healthy
+/// Lance fragments.
 pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 128 << 20;
 /// Whether to compact the chunks table after a hybrid-index build by default.
 pub const DEFAULT_COMPACT_ON_BUILD: bool = true;
@@ -157,8 +158,8 @@ pub struct Config {
     /// name recorded in the index. Pinning is by name only; turn this off to
     /// bypass the check (e.g. when intentionally serving with a renamed model).
     pub embed_verify_model: bool,
-    /// Base URL of the archive Solr core used by `update`, e.g.
-    /// `https://metadata.idl.ucsf.edu/solr/ltdl3`. `None` disables `update`;
+    /// Base URL of the archive Solr core used by `ingest`, e.g.
+    /// `https://metadata.idl.ucsf.edu/solr/ltdl3`. `None` disables ingest/update;
     /// unused by the serving path.
     pub solr_url: Option<String>,
     /// Solr `q` selecting the corpus to track for updates.

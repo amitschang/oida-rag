@@ -1,30 +1,3 @@
-//! Parquet → LanceDB ingest.
-//!
-//! Loads the source parquet into the embedded LanceDB store using DataFusion —
-//! the same query engine [`crate::sql`] serves ad-hoc SQL with, and the same one
-//! LanceDB itself is built on, so there is a single ingest path and no external
-//! database dependency.
-//!
-//! The source parquet holds one row per document, with the document's artifacts
-//! inline as a `list<struct<md5, mediaType, name, size>>` column. Two tables are
-//! produced from a single streaming pass over it:
-//! - `documents`: one row per document — the metadata columns, an FTS-only
-//!   `search_text` column concatenating the searchable fields, and the artifact
-//!   list summarized into `artifact_types` (distinct media types) and
-//!   `artifact_count`.
-//! - `artifacts`: one row per artifact — the inline struct list exploded so
-//!   artifact fields (`name`, `media_type`, …) can be indexed and queried.
-//!
-//! Because each row is already one document, there is no deduplication and no
-//! aggregation: every output row is final the instant it is read, so the pass
-//! streams batch-by-batch with bounded memory. The per-document `artifact_types`
-//! summary and the artifact explode both require reaching into the struct list,
-//! which SQL cannot express over a `list<struct>`, so each batch's artifact
-//! column is walked once in Rust to produce both.
-//!
-//! DataFusion is pinned to the same version `lance` uses, so the arrow types it
-//! produces match exactly the arrow LanceDB consumes.
-
 //! Solr → LanceDB metadata ingest.
 //!
 //! Streams the archive Solr corpus into the embedded LanceDB store, mapping each
@@ -43,7 +16,6 @@
 
 use anyhow::{Context, Result, bail};
 use arrow::array::RecordBatch;
-use indicatif::{ProgressBar, ProgressStyle};
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::index::scalar::FtsIndexBuilder;
@@ -52,6 +24,7 @@ use std::io::IsTerminal;
 
 use crate::config::Config;
 use crate::index::{ARTIFACTS_TABLE, DOCUMENTS_TABLE, write_watermark};
+use crate::progress::documents_bar;
 use crate::solr::CURSOR_START;
 use crate::{solr_map, update};
 
@@ -82,13 +55,11 @@ pub(crate) async fn connect(config: &Config) -> Result<Connection> {
 
 /// Ingest document and artifact metadata from the Solr source into LanceDB.
 ///
-/// This is the canonical metadata ingest now that the parquet route is retired:
-/// it streams the Solr corpus by `cursorMark` and maps each document into the
-/// `documents`/`artifacts` tables via [`crate::solr_map`], producing the same
-/// schema the serving path and full-text build expect (plus the new
-/// `ddmudate`/`digest` columns). It rebuilds those tables from scratch — and
-/// drops the derived `chunks`/`_meta` tables, which a `--full-text` pass
-/// regenerates.
+/// Streams the Solr corpus by `cursorMark` and maps each document into the
+/// `documents`/`artifacts` tables via [`crate::solr_map`], producing the schema
+/// the serving path and full-text build expect (including the `ddmudate`/`digest`
+/// columns). It rebuilds those tables from scratch — and drops the derived
+/// `chunks`/`_meta` tables, which a `--full-text` pass regenerates.
 ///
 /// `since` (an inclusive `ddmudate` lower bound) is intended for testing on a
 /// small window; omit it for a complete rebuild.
@@ -103,13 +74,12 @@ pub async fn ingest_from_solr(
     force: bool,
 ) -> Result<MetadataStats> {
     let db = connect(config).await?;
-    let existing = db.table_names().execute().await.context("listing tables")?;
 
     // Never replace an existing metadata index implicitly; require --force.
-    if !force && existing.iter().any(|n| n == DOCUMENTS_TABLE) {
+    if !force && crate::index::has_table(&db, DOCUMENTS_TABLE).await? {
         bail!(
             "a metadata index already exists at {}; pass --force to rebuild it, \
-             or use `update --apply` for an incremental update",
+             or run `ingest` (without --force) for an incremental update",
             config.lance_path.display()
         );
     }
@@ -131,10 +101,9 @@ pub async fn ingest_from_solr(
         .iter()
         .chain(FULLTEXT_TABLES.iter())
     {
-        if existing.iter().any(|n| n == *name) {
-            db.drop_table(name, &[])
-                .await
-                .with_context(|| format!("dropping table {name}"))?;
+        match db.drop_table(name, &[]).await {
+            Ok(()) | Err(lancedb::Error::TableNotFound { .. }) => {}
+            Err(e) => return Err(e).with_context(|| format!("dropping table {name}")),
         }
     }
 
@@ -145,15 +114,7 @@ pub async fn ingest_from_solr(
     // On a TTY render a live progress bar; off a TTY indicatif hides it, so the
     // periodic `tracing` lines below keep pod logs informative.
     let tty = std::io::stderr().is_terminal();
-    let bar = ProgressBar::new(page.num_found);
-    bar.set_style(
-        ProgressStyle::with_template(
-            "{prefix:<9} {bar:28.yellow/blue} {pos:>9}/{len:>9} docs │ {per_sec}",
-        )
-        .expect("valid template")
-        .progress_chars("=>-"),
-    );
-    bar.set_prefix("documents");
+    let bar = documents_bar(page.num_found);
     let mut cursor = CURSOR_START.to_string();
     let mut scanned: u64 = 0;
     let mut watermark: Option<String> = None;

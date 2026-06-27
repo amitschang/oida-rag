@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// A single stored artifact belonging to a [`Document`].
 ///
-/// Each parquet row corresponds to one artifact (e.g. the `.ocr` text, the
-/// `.pdf`, or a `_thumb.png`). Artifacts are grouped under a document `id`.
+/// Each artifact is one file (e.g. the `.ocr` text, the `.pdf`, or a
+/// `_thumb.png`); all of a document's artifacts are grouped under its `id`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Artifact {
     /// Document id this artifact belongs to.
@@ -44,7 +44,7 @@ pub struct RawArtifact {
     pub data: Vec<u8>,
 }
 
-/// Document-level metadata, deduplicated from the per-artifact parquet rows.
+/// Document-level metadata: one row per source document.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Document {
     /// Stable document identifier (groups all of a document's artifacts).
@@ -157,23 +157,37 @@ pub struct RelatedEdge {
 
 /// The result of running a read-only SQL query against the cache.
 ///
-/// On success, `columns` names the projected columns and `rows` holds one
-/// JSON-valued cell per column (lists/structs become JSON arrays/objects).
-/// On failure (invalid or rejected SQL, or a DataFusion execution error),
-/// `error` carries a human-readable message and `rows` is empty — letting the
-/// model read the error and correct its query.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+/// On success, `columns` names the projected columns and `rows` holds the
+/// result as a JSON array of objects keyed by column name (lists/structs become
+/// JSON arrays/objects). Rows is expected to be a valid json string, hence the
+/// RawValue. On failure (invalid or rejected SQL, or a DataFusion execution
+/// error), `error` carries a human-readable message and `rows` is an empty
+/// array — letting the model read the error and correct its query.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SqlQueryResult {
     /// Column names in projection order.
     pub columns: Vec<String>,
-    /// Result rows; each row has one JSON value per column.
-    pub rows: Vec<Vec<serde_json::Value>>,
-    /// Number of rows returned (`rows.len()`).
+    /// Result rows as a JSON array of objects keyed by column name.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub rows: Box<serde_json::value::RawValue>,
+    /// Number of rows returned.
     pub row_count: usize,
     /// True if more rows existed than the requested row cap.
     pub truncated: bool,
     /// Error message when the query was rejected or failed; `None` on success.
     pub error: Option<String>,
+}
+
+impl Default for SqlQueryResult {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: empty_json_rows(),
+            row_count: 0,
+            truncated: false,
+            error: None,
+        }
+    }
 }
 
 impl SqlQueryResult {
@@ -184,6 +198,12 @@ impl SqlQueryResult {
             ..Self::default()
         }
     }
+}
+
+/// An empty JSON array (`[]`) for use as the default/error-case `rows` value.
+fn empty_json_rows() -> Box<serde_json::value::RawValue> {
+    serde_json::value::RawValue::from_string("[]".to_string())
+        .expect("`[]` is valid JSON")
 }
 
 /// One column of a table, as reported by `DESCRIBE`.

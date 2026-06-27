@@ -11,15 +11,15 @@
 //! already-ingested `artifacts` table — not by the Solr stream — so it composes
 //! with the incremental workflow:
 //!
-//! * `ingest --store-raw` rebuilds the table from scratch.
-//! * `ingest --resume --store-raw` fills in only the artifacts not already
-//!   stored, so it can be re-run after `update --apply` to pick up new and
-//!   changed documents. (`update --apply` deletes the raw rows of changed and
-//!   redacted documents up front, so resume re-fetches their current bytes.)
+//! * `ingest --force --store-raw` rebuilds the table from scratch.
+//! * `ingest --store-raw` (incremental) fills in only the artifacts not already
+//!   stored, picking up new and changed documents after the metadata update in
+//!   the same command. (The incremental update deletes the raw rows of changed
+//!   and redacted documents up front, so this re-fetches their current bytes.)
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use arrow::array::{Int64Builder, LargeBinaryBuilder, RecordBatch, StringBuilder};
@@ -29,11 +29,12 @@ use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Connection, Table};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::index::{Index, RAW_ARTIFACTS_TABLE, RawArtifactRef, raw_refs_from_batch, str_col};
 use crate::ingest::connect;
+use crate::progress::{RawProgress, run_ticker};
 use crate::source::ArtifactSource;
 
 /// Number of artifacts fetched concurrently per round and buffered before they
@@ -64,34 +65,28 @@ pub struct RawStats {
     pub missing: u64,
 }
 
-/// Live counters for the raw-storage pass, updated lock-free as artifacts are
-/// fetched and sampled by the shared progress ticker when raw storage runs
-/// concurrently with the full-text build. Mirrors the figures in [`RawStats`]
-/// plus the in-flight download count and bytes transferred.
-#[derive(Default)]
-pub(crate) struct RawProgress {
-    /// Candidate artifacts to fetch this run (after skipping already-stored).
-    pub total: AtomicU64,
-    /// Artifacts already present and skipped (resume only).
-    pub skipped: AtomicU64,
-    /// Artifacts fetched and written so far.
-    pub stored: AtomicU64,
-    /// Referenced artifacts whose bytes were absent from the source.
-    pub missing: AtomicU64,
-    /// Bytes downloaded so far.
-    pub bytes: AtomicU64,
-    /// Fetches currently in flight.
-    pub inflight: AtomicU64,
-}
-
 /// Build (or extend) the `raw_artifacts` table.
 ///
 /// Fresh (`resume == false`) drops any existing table and stores every non-text
 /// artifact. Resume (`resume == true`) keeps the table and stores only the
 /// artifacts whose `(id, name)` is not already present, so it can be re-run
-/// incrementally after `update --apply`.
+/// incrementally after an in-place metadata update.
+///
+/// Owns its own progress and ticker so a standalone raw build still renders a
+/// live status line. The concurrent orchestrator instead drives
+/// [`build_with_progress`] with a shared ticker so raw storage and the full-text
+/// build render on one status line.
 pub async fn build(config: &Config, index: &Index, resume: bool) -> Result<RawStats> {
-    build_with_progress(config, index, resume, None).await
+    let progress = Arc::new(RawProgress::default());
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let ticker = {
+        let progress = progress.clone();
+        tokio::spawn(run_ticker(None, Some(progress), stop_rx))
+    };
+    let result = build_with_progress(config, index, resume, Some(progress.as_ref())).await;
+    let _ = stop_tx.send(());
+    let _ = ticker.await;
+    result
 }
 
 /// Like [`build`], but reports live progress into `progress` when present. Used
@@ -383,7 +378,8 @@ fn key128(id: &str, name: &str) -> u128 {
     ((hash_seeded(0) as u128) << 64) | hash_seeded(1) as u128
 }
 
-/// Fetch a slice of artifacts' bytes concurrently, dropping any whose file is
+/// Append one assembled fragment to LanceDB, creating the `raw_artifacts` table
+/// on the first write and reusing the handle thereafter.
 async fn write_batch(db: &Connection, table: &mut Option<Table>, batch: RecordBatch) -> Result<()> {
     match table {
         Some(t) => {

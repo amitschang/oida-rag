@@ -20,17 +20,88 @@ use mcp_client::McpClient;
 
 /// CLI arguments. Flags override config-file and environment values.
 #[derive(Debug, Parser)]
-#[command(name = "oida-cli", about = "Chat with the OIDA document archive via a local LLM")]
+#[command(
+    name = "oida-cli",
+    about = "Query and maintain the OIDA document archive",
+    arg_required_else_help = true
+)]
 struct Args {
+    #[command(flatten)]
+    global: GlobalArgs,
+
+    /// Subcommand to run.
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Options shared by every subcommand (resolved before dispatch).
+#[derive(Debug, clap::Args)]
+struct GlobalArgs {
     /// Path to a TOML config file.
-    #[arg(long, env = "OIDA_CONFIG", default_value = "oida.toml")]
+    #[arg(long, env = "OIDA_CONFIG", default_value = "oida.toml", global = true)]
     config: PathBuf,
 
     /// Path to the LanceDB database directory (overrides config).
-    #[arg(long, env = "OIDA_LANCE")]
+    #[arg(long, env = "OIDA_LANCE", global = true)]
     lance_path: Option<PathBuf>,
 
-    /// Ollama model to use (overrides config).
+    /// OpenAI-compatible host URL for embeddings, e.g. a vLLM sidecar at
+    /// `http://localhost:8000` (overrides config). Accepts a comma-separated list
+    /// of replica addresses to balance across by least connections, e.g.
+    /// `http://vllm-a:8000,http://vllm-b:8000`. Used when building the full-text
+    /// index and when embedding queries for semantic search.
+    #[arg(long, env = "OIDA_EMBED_HOST", global = true)]
+    embed_host: Option<String>,
+
+    /// Bearer token sent with embed requests, for a server started with an API
+    /// key (overrides config).
+    #[arg(long, env = "OIDA_EMBED_API_KEY", global = true)]
+    embed_api_key: Option<String>,
+
+    /// Embedding model for the full-text index (overrides config).
+    #[arg(long, env = "OIDA_EMBED_MODEL", global = true)]
+    embed_model: Option<String>,
+
+    /// Verify the configured embed model name matches the index's at query time
+    /// (overrides config). Pass `--embed-verify-model false` to bypass.
+    #[arg(long, env = "OIDA_EMBED_VERIFY_MODEL", global = true)]
+    embed_verify_model: Option<bool>,
+}
+
+/// Top-level subcommands.
+#[derive(Debug, Subcommand)]
+// `IngestArgs` carries many tuning fields, making it the largest variant. The
+// command enum is parsed once at startup, so the size asymmetry is irrelevant
+// and boxing would fight clap's `Subcommand` derive.
+#[allow(clippy::large_enum_variant)]
+enum Command {
+    /// Chat with the archive via a local LLM (interactive, or one-shot with
+    /// `--once`).
+    ///
+    /// Requires an ingested index; build one with `oida-cli ingest --force`
+    /// first.
+    Chat(ChatArgs),
+    /// Ingest or update document/artifact metadata from Solr, and optionally
+    /// build the derived full-text and raw-artifact stores.
+    ///
+    /// With no mode flag (or `--update`) this performs an incremental in-place
+    /// update from the stored watermark; `--force` rebuilds the metadata tables
+    /// from a full Solr scan; `--dry-run` previews the incremental delta without
+    /// writing. Add `--full-text` and/or `--store-raw` to (re)build those stores
+    /// after the metadata sync.
+    Ingest(IngestArgs),
+    /// Show statistics about the ingested index.
+    Stats,
+}
+
+/// Arguments for the `chat` subcommand.
+#[derive(Debug, clap::Args)]
+struct ChatArgs {
+    /// Run a single query non-interactively and exit (otherwise interactive).
+    #[arg(long)]
+    once: Option<String>,
+
+    /// Ollama model to use for the chat agent (overrides config).
     #[arg(long, env = "OIDA_MODEL")]
     model: Option<String>,
 
@@ -38,26 +109,111 @@ struct Args {
     #[arg(long, env = "OIDA_OLLAMA_HOST")]
     ollama_host: Option<String>,
 
-    /// OpenAI-compatible host URL for embeddings, e.g. a vLLM sidecar at
-    /// `http://localhost:8000` (overrides config). Accepts a comma-separated list
-    /// of replica addresses to balance across by least connections, e.g.
-    /// `http://vllm-a:8000,http://vllm-b:8000`.
-    #[arg(long, env = "OIDA_EMBED_HOST")]
-    embed_host: Option<String>,
+    /// Path to the oida-mcp-server binary (defaults to a sibling of this exe).
+    #[arg(long, env = "OIDA_SERVER_BIN")]
+    server_bin: Option<PathBuf>,
+}
 
-    /// Bearer token sent with embed requests, for a server started with an API
-    /// key (overrides config).
-    #[arg(long, env = "OIDA_EMBED_API_KEY")]
-    embed_api_key: Option<String>,
+/// Arguments for the `ingest` subcommand.
+#[derive(Debug, clap::Args)]
+struct IngestArgs {
+    /// Drop and rebuild the `documents`/`artifacts` tables from a full Solr
+    /// scan (drops derived chunks/_meta). Mutually exclusive with
+    /// `--update`/`--dry-run`.
+    #[arg(long, conflicts_with_all = ["update", "dry_run"])]
+    force: bool,
 
+    /// Incrementally sync metadata from Solr (upsert new/changed, delete
+    /// redacted, invalidate stale chunks) from the stored watermark. This is the
+    /// default when neither `--force` nor `--dry-run` is given.
+    #[arg(long)]
+    update: bool,
+
+    /// Preview the incremental delta without writing anything (read-only).
+    /// Mutually exclusive with `--force`.
+    #[arg(long, conflicts_with = "force")]
+    dry_run: bool,
+
+    /// Also (re)build the hybrid keyword + semantic full-text index over the OCR
+    /// artifacts. With `--force` it is rebuilt from scratch; otherwise only
+    /// new/changed documents are (re-)embedded.
+    #[arg(long)]
+    full_text: bool,
+
+    /// Also store raw (non-text) artifact bytes in the `raw_artifacts` blob
+    /// table, fetched from the configured artifact source. With `--force` it is
+    /// rebuilt; otherwise only new/changed documents are fetched.
+    #[arg(long)]
+    store_raw: bool,
+
+    /// Inclusive lower-bound modified-date (ISO-8601, e.g.
+    /// 2026-01-01T00:00:00Z). With `--force` omit for a full scan; otherwise
+    /// omit to use the stored watermark.
+    #[arg(long)]
+    since: Option<String>,
+
+    /// Fetch and print one full Solr document (all fields), then exit — to
+    /// inspect the source schema. Ignores all other flags.
+    #[arg(long)]
+    sample_doc: bool,
+
+    #[command(flatten)]
+    solr: SolrArgs,
+
+    #[command(flatten)]
+    source: ArtifactSourceArgs,
+
+    #[command(flatten)]
+    tuning: TuningArgs,
+}
+
+/// Solr source options (used by `ingest`).
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Solr source")]
+struct SolrArgs {
+    /// Solr core base URL (overrides config), e.g.
+    /// https://metadata.idl.ucsf.edu/solr/ltdl3.
+    #[arg(long, env = "OIDA_SOLR_URL")]
+    solr_url: Option<String>,
+
+    /// Solr `q` selecting the corpus (overrides config).
+    #[arg(long, env = "OIDA_SOLR_QUERY")]
+    solr_query: Option<String>,
+}
+
+/// Artifact-byte source options (used by `ingest` for `--full-text`/`--store-raw`).
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Artifact source (local or S3)")]
+struct ArtifactSourceArgs {
     /// Directory containing artifact files on disk (overrides config).
     #[arg(long, env = "OIDA_ARTIFACT_ROOT")]
     artifact_root: Option<PathBuf>,
 
-    /// Embedding model for the full-text index (overrides config).
-    #[arg(long, env = "OIDA_EMBED_MODEL")]
-    embed_model: Option<String>,
+    /// S3 bucket holding the artifact files; when set, reads fetch artifacts
+    /// from S3 instead of `artifact_root` (overrides config).
+    #[arg(long, env = "OIDA_S3_BUCKET")]
+    s3_bucket: Option<String>,
 
+    /// AWS region for the S3 bucket (overrides config).
+    #[arg(long, env = "OIDA_S3_REGION")]
+    s3_region: Option<String>,
+
+    /// Custom S3 endpoint URL for S3-compatible stores, e.g. MinIO/Ceph/R2
+    /// (overrides config). Credentials come from the standard AWS environment.
+    #[arg(long, env = "OIDA_S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+
+    /// Key prefix prepended to the fan-out artifact path within the bucket
+    /// (overrides config).
+    #[arg(long, env = "OIDA_S3_PREFIX")]
+    s3_prefix: Option<String>,
+}
+
+/// Build-tuning options for the metadata ingest and full-text build (used by
+/// `ingest`).
+#[derive(Debug, clap::Args)]
+#[command(next_help_heading = "Build tuning")]
+struct TuningArgs {
     /// Target size, in bytes, of each embedded text chunk (overrides config).
     #[arg(long, env = "OIDA_CHUNK_BYTES")]
     chunk_bytes: Option<usize>,
@@ -95,180 +251,94 @@ struct Args {
     /// concurrency so a slow request can't starve the backend (overrides config).
     #[arg(long, env = "OIDA_EMBED_LOOKAHEAD")]
     embed_lookahead: Option<usize>,
-
-    /// Verify the configured embed model name matches the index's at query time
-    /// (overrides config). Pass `--embed-verify-model false` to bypass.
-    #[arg(long, env = "OIDA_EMBED_VERIFY_MODEL")]
-    embed_verify_model: Option<bool>,
-
-    /// Path to the oida-mcp-server binary (defaults to a sibling of this exe).
-    #[arg(long, env = "OIDA_SERVER_BIN")]
-    server_bin: Option<PathBuf>,
-
-    /// Solr core base URL for `update` (overrides config), e.g.
-    /// https://metadata.idl.ucsf.edu/solr/ltdl3.
-    #[arg(long, env = "OIDA_SOLR_URL", global = true)]
-    solr_url: Option<String>,
-
-    /// Solr `q` selecting the corpus for `update` (overrides config).
-    #[arg(long, env = "OIDA_SOLR_QUERY", global = true)]
-    solr_query: Option<String>,
-
-    /// S3 bucket holding the artifact files; when set, ingest/full-text reads
-    /// fetch artifacts from S3 instead of `artifact_root` (overrides config).
-    #[arg(long, env = "OIDA_S3_BUCKET", global = true)]
-    s3_bucket: Option<String>,
-
-    /// AWS region for the S3 bucket (overrides config).
-    #[arg(long, env = "OIDA_S3_REGION", global = true)]
-    s3_region: Option<String>,
-
-    /// Custom S3 endpoint URL for S3-compatible stores, e.g. MinIO/Ceph/R2
-    /// (overrides config). Credentials come from the standard AWS environment.
-    #[arg(long, env = "OIDA_S3_ENDPOINT", global = true)]
-    s3_endpoint: Option<String>,
-
-    /// Key prefix prepended to the fan-out artifact path within the bucket
-    /// (overrides config).
-    #[arg(long, env = "OIDA_S3_PREFIX", global = true)]
-    s3_prefix: Option<String>,
-
-    /// Run a single query non-interactively and exit.
-    #[arg(long)]
-    once: Option<String>,
-
-    /// Subcommand to run. When omitted, starts an interactive chat session.
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-/// Top-level subcommands. Chat is the default when none is given.
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Ingest the parquet into LanceDB (required before chatting).
-    ///
-    /// Loads document/artifact metadata always; pass `--full-text` to also
-    /// build the hybrid keyword + semantic text index over the OCR artifacts.
-    Ingest {
-        /// Also build the hybrid full-text/semantic index.
-        #[arg(long)]
-        full_text: bool,
-        /// Replace an existing index instead of failing.
-        #[arg(long)]
-        force: bool,
-        /// Store the raw (non-text) artifact bytes in a `raw_artifacts` blob
-        /// table, fetched from the configured artifact source (local or S3).
-        #[arg(long)]
-        store_raw: bool,
-        /// Continue an interrupted build, skipping work that is already done.
-        /// Select what to resume with `--full-text` and/or `--store-raw` (at
-        /// least one required); cannot combine with `--force`.
-        #[arg(long, conflicts_with = "force")]
-        resume: bool,
-    },
-    /// Show statistics about the ingested index.
-    Stats,
-    /// Show the delta an update would apply from the Solr source (read-only).
-    ///
-    /// Pages the archive Solr core from a modified-date watermark and classifies
-    /// each document against the live index without writing anything.
-    Update {
-        /// Perform the read-only dry run (the default when no mode flag is set).
-        #[arg(long)]
-        dry_run: bool,
-        /// Apply the update by writing to the index. Without --rebuild this is
-        /// an incremental in-place apply (upsert new/changed, delete redacted,
-        /// invalidate stale chunks); with --rebuild it is a full Solr re-ingest.
-        #[arg(long)]
-        apply: bool,
-        /// With --apply, rebuild the `documents`/`artifacts` tables from scratch
-        /// by re-ingesting the whole Solr corpus (drops derived chunks/_meta).
-        #[arg(long)]
-        rebuild: bool,
-        /// Inclusive lower-bound modified-date (ISO-8601, e.g.
-        /// 2026-01-01T00:00:00Z). Omit for a full scan from the beginning.
-        #[arg(long)]
-        since: Option<String>,
-        /// Fetch and print one full Solr document (all fields), then exit — to
-        /// learn the source schema. Ignores --dry-run.
-        #[arg(long)]
-        sample_doc: bool,
-    },
 }
 
 
-/// Overlay CLI-flag / env-var values onto the config loaded from file. Each
-/// field is only touched when the caller supplied it, so the precedence is
-/// defaults < config file < env var < CLI flag (clap resolves flag-over-env).
-fn apply_overrides(config: &mut Config, args: &Args) {
-    if let Some(p) = &args.lance_path {
+/// Overlay the global flags / env vars (shared by every subcommand) onto the
+/// config loaded from file. Each field is only touched when the caller supplied
+/// it, so the precedence is defaults < config file < env var < CLI flag (clap
+/// resolves flag-over-env).
+fn apply_global_overrides(config: &mut Config, g: &GlobalArgs) {
+    if let Some(p) = &g.lance_path {
         config.lance_path = p.clone();
     }
-    if let Some(m) = &args.model {
-        config.ollama_model = m.clone();
-    }
-    if let Some(h) = &args.ollama_host {
-        config.ollama_host = h.clone();
-    }
-    if let Some(h) = &args.embed_host {
+    if let Some(h) = &g.embed_host {
         config.embed_host = h.clone();
     }
-    if let Some(k) = &args.embed_api_key {
+    if let Some(k) = &g.embed_api_key {
         config.embed_api_key = Some(k.clone());
     }
-    if let Some(r) = &args.artifact_root {
-        config.artifact_root = Some(r.clone());
-    }
-    if let Some(m) = &args.embed_model {
+    if let Some(m) = &g.embed_model {
         config.embed_model = m.clone();
     }
-    if let Some(v) = args.chunk_bytes {
-        config.chunk_bytes = v;
-    }
-    if let Some(v) = args.chunk_overlap {
-        config.chunk_overlap = v;
-    }
-    if let Some(v) = args.write_buffer_bytes {
-        config.write_buffer_bytes = v;
-    }
-    if let Some(v) = args.compact_on_build {
-        config.compact_on_build = v;
-    }
-    if let Some(v) = args.ingest_buffer_bytes {
-        config.ingest_buffer_bytes = v;
-    }
-    if let Some(v) = args.embed_concurrency {
-        config.embed_concurrency = v;
-    }
-    if let Some(v) = args.read_concurrency {
-        config.read_concurrency = v;
-    }
-    if let Some(v) = args.embed_batch {
-        config.embed_batch = v;
-    }
-    if let Some(v) = args.embed_lookahead {
-        config.embed_lookahead = v;
-    }
-    if let Some(v) = args.embed_verify_model {
+    if let Some(v) = g.embed_verify_model {
         config.embed_verify_model = v;
     }
-    if let Some(u) = &args.solr_url {
+}
+
+/// Overlay the `chat`-specific flags onto the config.
+fn apply_chat_overrides(config: &mut Config, c: &ChatArgs) {
+    if let Some(m) = &c.model {
+        config.ollama_model = m.clone();
+    }
+    if let Some(h) = &c.ollama_host {
+        config.ollama_host = h.clone();
+    }
+}
+
+/// Overlay the `ingest`-specific flags (Solr source, artifact source, build
+/// tuning, raw-store toggle) onto the config.
+fn apply_ingest_overrides(config: &mut Config, a: &IngestArgs) {
+    if let Some(u) = &a.solr.solr_url {
         config.solr_url = Some(u.clone());
     }
-    if let Some(q) = &args.solr_query {
+    if let Some(q) = &a.solr.solr_query {
         config.solr_query = q.clone();
     }
-    if let Some(b) = &args.s3_bucket {
+    if let Some(r) = &a.source.artifact_root {
+        config.artifact_root = Some(r.clone());
+    }
+    if let Some(b) = &a.source.s3_bucket {
         config.s3_bucket = Some(b.clone());
     }
-    if let Some(r) = &args.s3_region {
+    if let Some(r) = &a.source.s3_region {
         config.s3_region = Some(r.clone());
     }
-    if let Some(e) = &args.s3_endpoint {
+    if let Some(e) = &a.source.s3_endpoint {
         config.s3_endpoint = Some(e.clone());
     }
-    if let Some(p) = &args.s3_prefix {
+    if let Some(p) = &a.source.s3_prefix {
         config.s3_prefix = Some(p.clone());
+    }
+    if let Some(v) = a.tuning.chunk_bytes {
+        config.chunk_bytes = v;
+    }
+    if let Some(v) = a.tuning.chunk_overlap {
+        config.chunk_overlap = v;
+    }
+    if let Some(v) = a.tuning.write_buffer_bytes {
+        config.write_buffer_bytes = v;
+    }
+    if let Some(v) = a.tuning.compact_on_build {
+        config.compact_on_build = v;
+    }
+    if let Some(v) = a.tuning.ingest_buffer_bytes {
+        config.ingest_buffer_bytes = v;
+    }
+    if let Some(v) = a.tuning.embed_concurrency {
+        config.embed_concurrency = v;
+    }
+    if let Some(v) = a.tuning.read_concurrency {
+        config.read_concurrency = v;
+    }
+    if let Some(v) = a.tuning.embed_batch {
+        config.embed_batch = v;
+    }
+    if let Some(v) = a.tuning.embed_lookahead {
+        config.embed_lookahead = v;
+    }
+    if a.store_raw {
+        config.store_raw_artifacts = true;
     }
 }
 
@@ -302,29 +372,30 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let mut config = Config::load(&args.config)?;
-    apply_overrides(&mut config, &args);
+    let mut config = Config::load(&args.global.config)?;
+    apply_global_overrides(&mut config, &args.global);
 
-    // Dispatch management subcommands before touching the MCP server.
-    match &args.command {
-        Some(Command::Ingest { full_text, force, store_raw, resume }) => {
-            if *store_raw {
-                config.store_raw_artifacts = true;
-            }
-            return run_ingest(&config, *full_text, *force, *resume).await;
+    match args.command {
+        Command::Ingest(a) => {
+            apply_ingest_overrides(&mut config, &a);
+            run_ingest(&config, &a).await
         }
-        Some(Command::Stats) => return run_stats(&config).await,
-        Some(Command::Update { dry_run, apply, rebuild, since, sample_doc }) => {
-            return run_update(&config, *dry_run, *apply, *rebuild, since.clone(), *sample_doc).await;
+        Command::Stats => run_stats(&config).await,
+        Command::Chat(c) => {
+            apply_chat_overrides(&mut config, &c);
+            run_chat(&config, &c).await
         }
-        None => {}
     }
+}
 
+/// Run the `chat` subcommand: connect to the MCP server and drive the agent,
+/// either interactively or for a single `--once` query.
+async fn run_chat(config: &Config, args: &ChatArgs) -> anyhow::Result<()> {
     // Chatting requires an ingested index; never build it implicitly.
-    if !Index::is_ingested(&config).await {
+    if !Index::is_ingested(config).await {
         eprintln!(
-            "No index found at {}.\nRun `oida-cli ingest` (add --full-text for semantic search) \
-             before chatting.",
+            "No index found at {}.\nRun `oida-cli ingest --force` (add --full-text for semantic \
+             search) before chatting.",
             config.lance_path.display()
         );
         std::process::exit(1);
@@ -350,42 +421,42 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-/// Run the `ingest` subcommand: load metadata, then optionally the full-text
-/// index, reporting progress to stderr.
-async fn run_ingest(
-    config: &Config,
-    full_text: bool,
-    force: bool,
-    resume: bool,
-) -> anyhow::Result<()> {
-    let do_raw = config.store_raw_artifacts;
-    let do_text = full_text;
-
-    // Resuming continues an interrupted build only; the metadata tables it
-    // relies on are already present, so skip re-ingesting them (which would
-    // otherwise refuse to run or wipe the partial tables). `--store-raw` and
-    // `--full-text` select *which* derived data to resume; at least one is
-    // required. Re-run either after `update --apply` to pick up new/changed
-    // documents.
-    if resume {
-        if !do_raw && !do_text {
-            anyhow::bail!(
-                "--resume needs a selector: pass --full-text and/or --store-raw \
-                 to choose what to resume"
-            );
-        }
-        let index = Index::open(config)
-            .await
-            .context("opening index to resume (run a metadata ingest first)")?;
-        return run_derived_builds(config, &index, do_raw, do_text, false, true).await;
+/// Run the `ingest` subcommand. Dispatches between the read-only sample/dry-run
+/// inspectors, a forced full rebuild, and the default incremental update,
+/// reporting progress to stderr.
+async fn run_ingest(config: &Config, a: &IngestArgs) -> anyhow::Result<()> {
+    if a.sample_doc {
+        return run_sample_doc(config, a.since.as_deref()).await;
     }
+    if a.dry_run {
+        return run_dry_run(config, a.since.as_deref()).await;
+    }
+    if a.force {
+        return run_force_ingest(config, a).await;
+    }
+    // A plain (incremental) ingest against an empty location has nothing to
+    // update in place, so bootstrap it with a full build automatically — the
+    // first `ingest` should "just work" without requiring `--force`.
+    if !Index::is_ingested(config).await {
+        eprintln!("No index found at {}; building it fresh…", config.lance_path.display());
+        return run_force_ingest(config, a).await;
+    }
+    run_incremental(config, a).await
+}
 
+/// `ingest --force`: drop and rebuild the metadata tables from a full Solr
+/// scan, then (re)build the requested derived stores from scratch.
+async fn run_force_ingest(config: &Config, a: &IngestArgs) -> anyhow::Result<()> {
     eprintln!(
-        "Ingesting metadata from Solr {} (q={:?})…",
+        "Rebuilding documents/artifacts from Solr {} (q={:?}){}…",
         config.solr_url.as_deref().unwrap_or("<unset>"),
-        config.solr_query
+        config.solr_query,
+        a.since
+            .as_deref()
+            .map(|s| format!(" since {s}"))
+            .unwrap_or_default()
     );
-    let stats = ingest::ingest_from_solr(config, None, force)
+    let stats = ingest::ingest_from_solr(config, a.since.as_deref(), true)
         .await
         .context("ingesting metadata")?;
     eprintln!(
@@ -393,10 +464,115 @@ async fn run_ingest(
         stats.documents, stats.artifacts
     );
 
-    if do_raw || do_text {
+    if a.store_raw || a.full_text {
         let index = Index::open(config).await.context("opening index")?;
-        run_derived_builds(config, &index, do_raw, do_text, force, false).await?;
+        run_derived_builds(config, &index, a.store_raw, a.full_text, true, false).await?;
     }
+    Ok(())
+}
+
+/// `ingest` (default) / `ingest --update`: incrementally sync metadata from
+/// Solr in place, then resume the requested derived stores so new/changed
+/// documents are (re-)processed in the same command.
+async fn run_incremental(config: &Config, a: &IngestArgs) -> anyhow::Result<()> {
+    let index = Index::open(config)
+        .await
+        .context("opening index (run `oida-cli ingest --force` first to build it)")?;
+    eprintln!(
+        "Applying incremental update from Solr {} (q={:?}){}…",
+        config.solr_url.as_deref().unwrap_or("<unset>"),
+        config.solr_query,
+        a.since
+            .as_deref()
+            .map(|s| format!(" since {s}"))
+            .unwrap_or_else(|| " since stored watermark".to_string())
+    );
+    let stats = update::apply(config, &index, a.since.as_deref())
+        .await
+        .context("applying incremental update")?;
+    println!("Incremental update applied ({})", config.lance_path.display());
+    match &stats.since {
+        Some(s) => println!("  since (modified ≥):  {s}"),
+        None => println!("  since (modified ≥):  <full scan>"),
+    }
+    println!("  solr numFound:       {}", stats.num_found);
+    println!("  pages fetched:       {}", stats.pages);
+    println!("  documents scanned:   {}", stats.scanned);
+    println!("  new (inserted):      {}", stats.new);
+    println!("  changed (upserted):  {}", stats.changed);
+    println!("  unchanged (skipped): {}", stats.unchanged);
+    println!("  redacted (deleted):  {}", stats.redacted);
+    println!("  documents upserted:  {}", stats.upserted);
+    println!("  chunks invalidated:  {}", stats.chunks_invalidated);
+    println!("  raw invalidated:     {}", stats.raw_invalidated);
+    match &stats.watermark {
+        Some(w) => println!("  watermark written:   {w}"),
+        None => println!("  watermark written:   <unchanged>"),
+    }
+
+    if a.store_raw || a.full_text {
+        run_derived_builds(config, &index, a.store_raw, a.full_text, false, true).await?;
+    } else if stats.changed > 0 || stats.redacted > 0 {
+        eprintln!(
+            "\nNote: stale chunks (and raw artifacts) for changed/redacted documents were \
+             removed; re-run with --full-text (add --store-raw to also refresh raw bytes) to \
+             re-process the affected documents."
+        );
+    }
+    Ok(())
+}
+
+/// `ingest --sample-doc`: fetch and print one full Solr document for schema
+/// inspection, then exit without writing.
+async fn run_sample_doc(config: &Config, since: Option<&str>) -> anyhow::Result<()> {
+    let doc = update::sample_doc(config, since)
+        .await
+        .context("fetching sample Solr document")?;
+    match doc {
+        Some(d) => println!("{}", serde_json::to_string_pretty(&d)?),
+        None => println!("No documents matched."),
+    }
+    Ok(())
+}
+
+/// `ingest --dry-run`: classify the Solr delta against the live index and print
+/// it without writing anything.
+async fn run_dry_run(config: &Config, since: Option<&str>) -> anyhow::Result<()> {
+    let index = Index::open(config)
+        .await
+        .context("opening index (run `oida-cli ingest --force` first to build it)")?;
+    eprintln!(
+        "Querying Solr {} (q={:?}){}…",
+        config.solr_url.as_deref().unwrap_or("<unset>"),
+        config.solr_query,
+        since.map(|s| format!(" since {s}")).unwrap_or_default()
+    );
+
+    let plan = update::dry_run(config, &index, since).await?;
+
+    println!("Update dry run ({})", config.lance_path.display());
+    match &plan.since {
+        Some(s) => println!("  since (modified ≥):  {s}"),
+        None => println!("  since (modified ≥):  <full scan>"),
+    }
+    println!("  solr numFound:       {}", plan.num_found);
+    println!("  pages fetched:       {}", plan.pages);
+    println!("  documents scanned:   {}", plan.scanned);
+    println!("  new (insert):        {}", plan.new);
+    println!("  changed (re-embed):  {}", plan.changed);
+    println!("  unchanged (skip):    {}", plan.unchanged);
+    println!("  redacted (delete):   {}", plan.redacted);
+    println!("  text artifacts to fetch: {}", plan.refetch_text_artifacts);
+    match &plan.max_modified {
+        Some(m) => println!("  next watermark:      {m}"),
+        None => println!("  next watermark:      <none>"),
+    }
+    eprintln!(
+        "\nNote: classification compares the Solr artifact name/md5 set against the \
+         indexed artifacts (content changes / redactions). No writes performed. Run \
+         `oida-cli ingest` (or `--update`) to apply the delta in place, or \
+         `oida-cli ingest --force` for a full Solr re-ingest."
+    );
     Ok(())
 }
 
@@ -528,148 +704,4 @@ fn human_bytes(n: u64) -> String {
         format!("{value:.1} {}", UNITS[unit])
     }
 }
-
-/// Run the `update` subcommand. With `--sample-doc` it dumps one Solr document
-/// for schema inspection; with `--apply --rebuild` it re-ingests the whole Solr
-/// corpus into the `documents`/`artifacts` tables; otherwise it runs the
-/// read-only dry-run differ, reporting the delta without writing.
-async fn run_update(
-    config: &Config,
-    dry_run: bool,
-    apply: bool,
-    rebuild: bool,
-    since: Option<String>,
-    sample_doc: bool,
-) -> anyhow::Result<()> {
-    if sample_doc {
-        let doc = update::sample_doc(config, since.as_deref())
-            .await
-            .context("fetching sample Solr document")?;
-        match doc {
-            Some(d) => println!("{}", serde_json::to_string_pretty(&d)?),
-            None => println!("No documents matched."),
-        }
-        return Ok(());
-    }
-
-    if apply {
-        if rebuild {
-            eprintln!(
-                "Rebuilding documents/artifacts from Solr {} (q={:?}){}…",
-                config.solr_url.as_deref().unwrap_or("<unset>"),
-                config.solr_query,
-                since
-                    .as_deref()
-                    .map(|s| format!(" since {s}"))
-                    .unwrap_or_default()
-            );
-            let stats = ingest::ingest_from_solr(config, since.as_deref(), true)
-                .await
-                .context("re-ingesting from Solr")?;
-            println!("Solr re-ingest complete ({})", config.lance_path.display());
-            println!("  documents:  {}", stats.documents);
-            println!("  artifacts:  {}", stats.artifacts);
-            if config.store_raw_artifacts {
-                let index = Index::open(config).await.context("opening index")?;
-                eprintln!("Storing raw (non-text) artifacts…");
-                let rstats = raw::build(config, &index, false).await?;
-                println!("  raw:        {}", rstats.stored);
-            }
-            eprintln!(
-                "\nNote: derived chunks/_meta were dropped; run `ingest --full-text` to rebuild \
-                 the text-search index."
-            );
-            return Ok(());
-        }
-
-        let index = Index::open(config)
-            .await
-            .context("opening index (run a metadata ingest first)")?;
-        eprintln!(
-            "Applying incremental update from Solr {} (q={:?}){}…",
-            config.solr_url.as_deref().unwrap_or("<unset>"),
-            config.solr_query,
-            since
-                .as_deref()
-                .map(|s| format!(" since {s}"))
-                .unwrap_or_else(|| " since stored watermark".to_string())
-        );
-        let stats = update::apply(config, &index, since.as_deref())
-            .await
-            .context("applying incremental update")?;
-        println!("Incremental update applied ({})", config.lance_path.display());
-        match &stats.since {
-            Some(s) => println!("  since (modified ≥):  {s}"),
-            None => println!("  since (modified ≥):  <full scan>"),
-        }
-        println!("  solr numFound:       {}", stats.num_found);
-        println!("  pages fetched:       {}", stats.pages);
-        println!("  documents scanned:   {}", stats.scanned);
-        println!("  new (inserted):      {}", stats.new);
-        println!("  changed (upserted):  {}", stats.changed);
-        println!("  unchanged (skipped): {}", stats.unchanged);
-        println!("  redacted (deleted):  {}", stats.redacted);
-        println!("  documents upserted:  {}", stats.upserted);
-        println!("  chunks invalidated:  {}", stats.chunks_invalidated);
-        println!("  raw invalidated:     {}", stats.raw_invalidated);
-        match &stats.watermark {
-            Some(w) => println!("  watermark written:   {w}"),
-            None => println!("  watermark written:   <unchanged>"),
-        }
-        if stats.changed > 0 || stats.redacted > 0 {
-            eprintln!(
-                "\nNote: stale chunks (and raw artifacts) for changed/redacted documents were \
-                 removed; run `ingest --resume` (add `--store-raw` to also refresh raw bytes) to \
-                 re-process the affected documents."
-            );
-        }
-        return Ok(());
-    }
-
-    if !dry_run {
-        anyhow::bail!(
-            "pass --dry-run for the read-only differ, or --apply --rebuild for a full Solr re-ingest"
-        );
-    }
-
-    let index = Index::open(config)
-        .await
-        .context("opening index (run a metadata ingest first)")?;
-    eprintln!(
-        "Querying Solr {} (q={:?}){}…",
-        config.solr_url.as_deref().unwrap_or("<unset>"),
-        config.solr_query,
-        since
-            .as_deref()
-            .map(|s| format!(" since {s}"))
-            .unwrap_or_default()
-    );
-
-    let plan = update::dry_run(config, &index, since.as_deref()).await?;
-
-    println!("Update dry run ({})", config.lance_path.display());
-    match &plan.since {
-        Some(s) => println!("  since (modified ≥):  {s}"),
-        None => println!("  since (modified ≥):  <full scan>"),
-    }
-    println!("  solr numFound:       {}", plan.num_found);
-    println!("  pages fetched:       {}", plan.pages);
-    println!("  documents scanned:   {}", plan.scanned);
-    println!("  new (insert):        {}", plan.new);
-    println!("  changed (re-embed):  {}", plan.changed);
-    println!("  unchanged (skip):    {}", plan.unchanged);
-    println!("  redacted (delete):   {}", plan.redacted);
-    println!("  text artifacts to fetch: {}", plan.refetch_text_artifacts);
-    match &plan.max_modified {
-        Some(m) => println!("  next watermark:      {m}"),
-        None => println!("  next watermark:      <none>"),
-    }
-    eprintln!(
-        "\nNote: classification compares the Solr artifact name/md5 set against the \
-         indexed artifacts (content changes / redactions). No writes performed. Use \
-         --apply to apply the delta in place, or --apply --rebuild for a full Solr re-ingest."
-    );
-    Ok(())
-}
-
 
