@@ -5,18 +5,17 @@
 //! everything else (and any missing files) returns a structured status so the
 //! model can reason about the outcome instead of seeing an opaque error.
 
-use std::path::{Path, PathBuf};
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::source::ArtifactSource;
 
 /// Outcome of an artifact-text request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactTextStatus {
-    /// No `artifact_root` is configured, so files cannot be located.
+    /// No artifact source (`artifact_root` / `s3_bucket`) is configured, so
+    /// files cannot be located.
     ArtifactRootNotConfigured,
     /// The file does not exist under `artifact_root`.
     ArtifactFileMissing,
@@ -64,31 +63,21 @@ pub(crate) fn is_text(name: &str, media_type: Option<&str>) -> bool {
     media_type == Some("text/plain") || name.to_lowercase().ends_with(".ocr")
 }
 
-/// Resolve an artifact's on-disk path under `root`.
-///
-/// The layout fans artifacts out under a directory per leading character, then
-/// a directory named for the artifact's stem (the name without its extension),
-/// then the file itself, e.g. `mskf0352.ocr` -> `m/s/k/f/mskf0352/mskf0352.ocr`.
-pub fn artifact_path(root: &Path, name: &str) -> PathBuf {
-    let stem = name.split('.').next().unwrap_or(name);
-    let mut path = root.to_path_buf();
-    for c in name.chars().take(4) {
-        path.push(c.to_string());
-    }
-    path.push(stem);
-    path.push(name);
-    path
-}
-
 /// Read up to `max_bytes` of an artifact's text starting at `offset`.
-pub fn read_artifact_text(
-    config: &Config,
+///
+/// Bytes are fetched through the shared [`ArtifactSource`], so the same call
+/// serves a local `artifact_root` or an S3 bucket using the one fan-out key
+/// layout (the document `id` directory, then the artifact `name`). `source` is
+/// `None` when no artifact source is configured.
+pub async fn read_artifact_text(
+    source: Option<&ArtifactSource>,
+    id: &str,
     name: &str,
     media_type: Option<&str>,
     offset: u64,
     max_bytes: u64,
 ) -> ArtifactText {
-    let Some(root) = &config.artifact_root else {
+    let Some(source) = source else {
         return ArtifactText::status_only(
             name,
             media_type.map(str::to_string),
@@ -104,18 +93,17 @@ pub fn read_artifact_text(
         );
     }
 
-    let path = artifact_path(root, name);
-    if !path_is_file(&path) {
-        return ArtifactText::status_only(
-            name,
-            media_type.map(str::to_string),
-            ArtifactTextStatus::ArtifactFileMissing,
-        );
-    }
-
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => {
+    let bytes = match source.get(id, name).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return ArtifactText::status_only(
+                name,
+                media_type.map(str::to_string),
+                ArtifactTextStatus::ArtifactFileMissing,
+            );
+        }
+        Err(e) => {
+            tracing::warn!("reading artifact {id}/{name}: {e}");
             return ArtifactText::status_only(
                 name,
                 media_type.map(str::to_string),
@@ -142,45 +130,43 @@ pub fn read_artifact_text(
     }
 }
 
-fn path_is_file(path: &Path) -> bool {
-    path.is_file()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
-    fn cfg(root: Option<std::path::PathBuf>) -> Config {
-        Config {
-            artifact_root: root,
+    fn source(root: std::path::PathBuf) -> ArtifactSource {
+        let config = Config {
+            artifact_root: Some(root),
             ..Config::default()
-        }
+        };
+        ArtifactSource::from_config(&config).unwrap().unwrap()
     }
 
-    #[test]
-    fn reports_missing_root() {
-        let r = read_artifact_text(&cfg(None), "x.ocr", Some("text/plain"), 0, 100);
+    #[tokio::test]
+    async fn reports_missing_root() {
+        let r = read_artifact_text(None, "x", "x.ocr", Some("text/plain"), 0, 100).await;
         assert_eq!(r.status, ArtifactTextStatus::ArtifactRootNotConfigured);
     }
 
-    #[test]
-    fn rejects_non_text_types() {
-        let dir = std::env::temp_dir();
-        let r = read_artifact_text(&cfg(Some(dir)), "x.pdf", Some("application/pdf"), 0, 100);
+    #[tokio::test]
+    async fn rejects_non_text_types() {
+        let src = source(std::env::temp_dir());
+        let r = read_artifact_text(Some(&src), "x", "x.pdf", Some("application/pdf"), 0, 100).await;
         assert_eq!(r.status, ArtifactTextStatus::UnsupportedArtifactType);
     }
 
-    #[test]
-    fn reports_missing_file() {
-        let dir = std::env::temp_dir();
-        let r = read_artifact_text(&cfg(Some(dir)), "does-not-exist.ocr", None, 0, 100);
+    #[tokio::test]
+    async fn reports_missing_file() {
+        let src = source(std::env::temp_dir());
+        let r =
+            read_artifact_text(Some(&src), "nope", "does-not-exist.ocr", None, 0, 100).await;
         assert_eq!(r.status, ArtifactTextStatus::ArtifactFileMissing);
     }
 
-    #[test]
-    fn loads_and_pages_text() {
+    #[tokio::test]
+    async fn loads_and_pages_text() {
         let dir = std::env::temp_dir().join(format!("oida-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         let path = dir
             .join("a")
             .join("b")
@@ -191,15 +177,20 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"hello world").unwrap();
 
-        let r = read_artifact_text(&cfg(Some(dir.clone())), "abcd_doc.ocr", Some("text/plain"), 0, 5);
+        let src = source(dir.clone());
+        let r =
+            read_artifact_text(Some(&src), "abcd_doc", "abcd_doc.ocr", Some("text/plain"), 0, 5)
+                .await;
         assert_eq!(r.status, ArtifactTextStatus::TextLoaded);
         assert_eq!(r.text.as_deref(), Some("hello"));
         assert_eq!(r.total_bytes, Some(11));
         assert!(r.truncated);
 
-        let r2 = read_artifact_text(&cfg(Some(dir)), "abcd_doc.ocr", Some("text/plain"), 6, 100);
+        let r2 =
+            read_artifact_text(Some(&src), "abcd_doc", "abcd_doc.ocr", Some("text/plain"), 6, 100)
+                .await;
         assert_eq!(r2.text.as_deref(), Some("world"));
         assert!(!r2.truncated);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -64,6 +64,34 @@ pub(crate) struct FullTextProgress {
     pub(crate) out_queued: AtomicU64,
 }
 
+struct FullTextProgressSnapshot {
+    chunks: u64,
+    bytes: u64,
+    scanned: u64,
+    missing: u64,
+    total_artifacts: u64,
+    reads_inflight: u64,
+    jobs_queued: u64,
+    embeds_inflight: u64,
+    out_queued: u64,
+}
+
+impl FullTextProgress {
+    fn snapshot(&self) -> FullTextProgressSnapshot {
+        FullTextProgressSnapshot {
+            chunks: self.chunks.load(Ordering::Relaxed),
+            bytes: self.text_bytes.load(Ordering::Relaxed),
+            scanned: self.scanned.load(Ordering::Relaxed),
+            missing: self.missing.load(Ordering::Relaxed),
+            total_artifacts: self.text_total.load(Ordering::Relaxed),
+            reads_inflight: self.reads_inflight.load(Ordering::Relaxed),
+            jobs_queued: self.jobs_queued.load(Ordering::Relaxed),
+            embeds_inflight: self.embeds_inflight.load(Ordering::Relaxed),
+            out_queued: self.out_queued.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Live counters for the raw-storage pass, updated lock-free as artifacts are
 /// fetched and sampled by [`run_ticker`]. Mirrors the figures in
 /// [`crate::raw::RawStats`] plus the in-flight download count and bytes
@@ -82,6 +110,28 @@ pub(crate) struct RawProgress {
     pub(crate) bytes: AtomicU64,
     /// Fetches currently in flight.
     pub(crate) inflight: AtomicU64,
+}
+
+/// A snapshot of the raw-download counters, sampled once per tick and shared by
+/// the bar and log render paths.
+struct RawProgressSnapshot {
+    stored: u64,
+    total: u64,
+    inflight: u64,
+    bytes: u64,
+    missing: u64,
+}
+
+impl RawProgress {
+    fn snapshot(&self) -> RawProgressSnapshot {
+        RawProgressSnapshot {
+            stored: self.stored.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+            inflight: self.inflight.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            missing: self.missing.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Construct the metadata-ingest "documents" bar with the shared style. Updated
@@ -143,24 +193,8 @@ pub(crate) async fn run_ticker(
         let now = Instant::now();
 
         // Sample each pass's counters once per tick; shared by both render paths.
-        let text_vals = text.as_ref().map(|p| TextVals {
-            chunks: p.chunks.load(Ordering::Relaxed),
-            bytes: p.text_bytes.load(Ordering::Relaxed),
-            scanned: p.scanned.load(Ordering::Relaxed),
-            missing: p.missing.load(Ordering::Relaxed),
-            total_artifacts: p.text_total.load(Ordering::Relaxed),
-            reads_inflight: p.reads_inflight.load(Ordering::Relaxed),
-            jobs_queued: p.jobs_queued.load(Ordering::Relaxed),
-            embeds_inflight: p.embeds_inflight.load(Ordering::Relaxed),
-            out_queued: p.out_queued.load(Ordering::Relaxed),
-        });
-        let raw_vals = raw.as_ref().map(|raw| RawVals {
-            stored: raw.stored.load(Ordering::Relaxed),
-            total: raw.total.load(Ordering::Relaxed),
-            inflight: raw.inflight.load(Ordering::Relaxed),
-            bytes: raw.bytes.load(Ordering::Relaxed),
-            missing: raw.missing.load(Ordering::Relaxed),
-        });
+        let text_vals = text.as_ref().map(|p| p.snapshot());
+        let raw_vals = raw.as_ref().map(|raw| raw.snapshot());
 
         let chunks = text_vals.as_ref().map_or(0, |v| v.chunks);
         let bytes = text_vals.as_ref().map_or(0, |v| v.bytes);
@@ -286,30 +320,6 @@ pub(crate) async fn run_ticker(
             break;
         }
     }
-}
-
-/// A snapshot of the full-text counters, sampled once per tick and shared by the
-/// bar and log render paths.
-struct TextVals {
-    chunks: u64,
-    bytes: u64,
-    scanned: u64,
-    missing: u64,
-    total_artifacts: u64,
-    reads_inflight: u64,
-    jobs_queued: u64,
-    embeds_inflight: u64,
-    out_queued: u64,
-}
-
-/// A snapshot of the raw-download counters, sampled once per tick and shared by
-/// the bar and log render paths.
-struct RawVals {
-    stored: u64,
-    total: u64,
-    inflight: u64,
-    bytes: u64,
-    missing: u64,
 }
 
 /// The live progress bars driven by [`run_ticker`] on a TTY: a raw-download bar

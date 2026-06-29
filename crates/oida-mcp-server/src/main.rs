@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use oida_core::{Config, Index};
+use oida_core::{ArtifactSource, Config, Index};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -61,9 +61,19 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Build the artifact byte source (local dir or S3) once; `get_artifact_text`
+    // returns a status when none is configured.
+    let source = match ArtifactSource::from_config(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("artifact source unavailable ({e}); get_artifact_text disabled");
+            None
+        }
+    };
+
     tracing::info!("OIDA MCP server ready; serving over stdio");
 
-    let service = OidaServer::new(index, Arc::new(config), hybrid)
+    let service = OidaServer::new(index, hybrid, source)
         .serve(stdio())
         .await
         .context("starting MCP server")?;

@@ -29,11 +29,8 @@ use lancedb::Table;
 use lancedb::table::datafusion::BaseTableAdapter;
 use serde_json::value::RawValue;
 
-use crate::index::{ARTIFACTS_TABLE, DOCUMENTS_TABLE, Index};
+use crate::index::{ARTIFACTS_TABLE, CHUNKS_TABLE, DOCUMENTS_TABLE, Index};
 use crate::model::{ColumnInfo, SqlQueryResult, TableSchema};
-
-/// Name of the optional full-text chunks table (created by `--full-text`).
-const CHUNKS_TABLE: &str = "chunks";
 
 /// Validate that `sql` is a single, read-only statement.
 ///

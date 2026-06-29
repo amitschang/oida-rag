@@ -30,7 +30,7 @@ use crate::{solr_map, update};
 
 /// Names of the text-search and metadata tables created by a full-text build,
 /// dropped alongside metadata on a forced metadata re-ingest.
-const FULLTEXT_TABLES: &[&str] = &["chunks", "_meta"];
+const FULLTEXT_TABLES: &[&str] = &[crate::index::CHUNKS_TABLE, crate::hybrid::META_TABLE];
 
 /// Row counts produced by a metadata ingest.
 #[derive(Debug, Clone, Copy)]
@@ -124,10 +124,8 @@ pub async fn ingest_from_solr(
         }
         scanned += page.docs.len() as u64;
         for doc in &page.docs {
-            if let Some(m) = solr_map::doc_modified(doc, &config.solr_modified_field)
-                && watermark.as_deref().is_none_or(|cur| m.as_str() > cur)
-            {
-                watermark = Some(m);
+            if let Some(m) = solr_map::doc_modified(doc, &config.solr_modified_field) {
+                crate::index::track_max(&mut watermark, m);
             }
         }
         docs.push(solr_map::documents_batch(

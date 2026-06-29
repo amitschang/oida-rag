@@ -44,15 +44,15 @@ use lancedb::{Connection, Table};
 use crate::artifacts::is_text;
 use crate::config::{Config, DEFAULT_EMBED_LOOKAHEAD_FACTOR};
 use crate::embed::Embedder;
-use crate::index::{Index, text_refs_from_batch};
+use crate::index::{
+    CHUNKS_TABLE, Index, contains_table, has_table, i32_col, i64_col, str_col, text_refs_from_batch,
+};
 use crate::ingest::connect;
 use crate::progress::{FullTextProgress, run_ticker};
 use crate::source::ArtifactSource;
 
-/// Name of the table holding text chunks and their embeddings.
-const CHUNKS_TABLE: &str = "chunks";
 /// Name of the single-row table holding index metadata.
-const META_TABLE: &str = "_meta";
+pub(crate) const META_TABLE: &str = "_meta";
 /// Below this row count a vector (ANN) index is skipped; flat search is exact
 /// and fast enough, and IVF/PQ training needs a reasonable number of rows.
 const MIN_VECTOR_INDEX_ROWS: usize = 256;
@@ -122,8 +122,7 @@ impl HybridIndex {
     /// disagrees with the stored vectors.
     pub async fn open(config: &Config) -> Result<Self> {
         let db = connect(config).await?;
-        let names = db.table_names().execute().await.context("listing tables")?;
-        if !names.iter().any(|n| n == CHUNKS_TABLE) {
+        if !has_table(&db, CHUNKS_TABLE).await? {
             bail!(
                 "hybrid index not found at {}; build it first (oida-cli ingest --full-text)",
                 config.lance_path.display()
@@ -287,7 +286,7 @@ pub(crate) async fn build_with_progress(
 
     let db = connect(config).await?;
     let existing = db.table_names().execute().await.context("listing tables")?;
-    let have_index = existing.iter().any(|n| n == CHUNKS_TABLE);
+    let have_index = contains_table(&existing, CHUNKS_TABLE);
     if have_index && !force && !resume {
         bail!(
             "hybrid index already exists at {}; pass force to rebuild or resume to continue",
@@ -296,7 +295,7 @@ pub(crate) async fn build_with_progress(
     }
     if force {
         for name in [CHUNKS_TABLE, META_TABLE] {
-            if existing.iter().any(|n| n == name) {
+            if contains_table(&existing, name) {
                 db.drop_table(name, &[]).await.with_context(|| format!("dropping table {name}"))?;
             }
         }
@@ -317,7 +316,7 @@ pub(crate) async fn build_with_progress(
     if resume {
         // The interrupted build never wrote `_meta`; drop any stale one so the
         // finalize step can recreate it cleanly.
-        if existing.iter().any(|n| n == META_TABLE) {
+        if contains_table(&existing, META_TABLE) {
             db.drop_table(META_TABLE, &[]).await.context("dropping stale _meta table")?;
         }
         if have_index {
@@ -526,7 +525,7 @@ enum ReadOutcome {
     /// Chunk rows for one artifact (empty if the text was blank).
     Chunks(Vec<ChunkRow>),
     /// The referenced file was not on disk (skipped, not fatal).
-    Missing { doc_id: String, name: String },
+    Missing,
     /// Not a text artifact we read, or no text extracted; nothing to do.
     Empty,
 }
@@ -552,7 +551,7 @@ async fn read_one(
         // A referenced file may legitimately be absent (e.g. redacted documents),
         // so a miss is not fatal; the caller counts it.
         Ok(None) => {
-            return ReadOutcome::Missing { doc_id: doc_id.to_string(), name: name.to_string() };
+            return ReadOutcome::Missing;
         }
         Err(e) => {
             tracing::warn!("error reading artifact '{name}' (doc {doc_id}): {e:#}; skipping");
@@ -666,14 +665,7 @@ async fn run_reader(
                 ReadOutcome::Chunks(rows) => pending.extend(rows),
                 // Warn on the first miss so a wrong source is obvious; the
                 // end-of-build summary reports the total.
-                ReadOutcome::Missing { doc_id, name } => {
-                    if missing == 0 {
-                        tracing::warn!(
-                            "artifact '{name}' (doc {doc_id}) not found at {}; \
-                             skipping it and any further missing files (e.g. redacted)",
-                            source.key_display(&doc_id, &name),
-                        );
-                    }
+                ReadOutcome::Missing => {
                     missing += 1;
                     progress.missing.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -1016,16 +1008,6 @@ fn collapse_to_documents(batches: &[RecordBatch], limit: usize) -> Result<Vec<Hy
     Ok(out)
 }
 
-/// Downcast a named column to a [`StringArray`].
-fn str_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| anyhow::anyhow!("result missing column {name}"))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow::anyhow!("column {name} is not a string column"))
-}
-
 /// Produce a short single-line excerpt from chunk text.
 fn snippet(text: &str) -> String {
     const MAX: usize = 280;
@@ -1107,8 +1089,7 @@ async fn write_meta(db: &Connection, meta: &Meta) -> Result<()> {
 
 /// Read the single `_meta` row back.
 async fn read_meta(db: &Connection) -> Result<Meta> {
-    let names = db.table_names().execute().await.context("listing tables")?;
-    if !names.iter().any(|n| n == META_TABLE) {
+    if !has_table(db, META_TABLE).await? {
         bail!("hybrid index is missing its {META_TABLE} table; rebuild it");
     }
     let table = db.open_table(META_TABLE).execute().await.context("opening meta table")?;
@@ -1143,26 +1124,6 @@ async fn read_meta(db: &Connection) -> Result<Meta> {
         documents,
         chunks,
     })
-}
-
-/// Downcast a named column to an [`Int32Array`].
-fn i32_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| anyhow::anyhow!("meta missing column {name}"))?
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| anyhow::anyhow!("meta column {name} is not int32"))
-}
-
-/// Downcast a named column to an [`Int64Array`].
-fn i64_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| anyhow::anyhow!("meta missing column {name}"))?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow::anyhow!("meta column {name} is not int64"))
 }
 
 #[cfg(test)]

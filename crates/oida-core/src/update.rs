@@ -140,13 +140,8 @@ pub async fn dry_run(config: &Config, index: &Index, since: Option<&str>) -> Res
 
         for doc in &page.docs {
             plan.scanned += 1;
-            if let Some(m) = doc_modified(doc, &config.solr_modified_field)
-                && plan
-                    .max_modified
-                    .as_deref()
-                    .is_none_or(|cur| m.as_str() > cur)
-            {
-                plan.max_modified = Some(m);
+            if let Some(m) = doc_modified(doc, &config.solr_modified_field) {
+                crate::index::track_max(&mut plan.max_modified, m);
             }
 
             let Some(id) = doc_id(doc) else { continue };
@@ -226,10 +221,8 @@ pub async fn apply(config: &Config, index: &Index, since: Option<&str>) -> Resul
         let mut upsert: Vec<Value> = Vec::new();
         for doc in &page.docs {
             stats.scanned += 1;
-            if let Some(m) = doc_modified(doc, &config.solr_modified_field)
-                && watermark.as_deref().is_none_or(|cur| m.as_str() > cur)
-            {
-                watermark = Some(m);
+            if let Some(m) = doc_modified(doc, &config.solr_modified_field) {
+                crate::index::track_max(&mut watermark, m);
             }
 
             let Some(id) = doc_id(doc) else { continue };

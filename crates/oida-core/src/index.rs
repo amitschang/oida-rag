@@ -9,7 +9,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use arrow::array::{Array, Int64Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator, StringArray};
+use arrow::array::{
+    Array, Int32Array, Int64Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator,
+    StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance_index::scalar::FullTextSearchQuery;
@@ -261,7 +264,7 @@ impl Index {
 
         // Which text artifacts have been chunked into the full-text index.
         let mut ingested: HashSet<(String, String)> = HashSet::new();
-        if names.iter().any(|n| n == CHUNKS_TABLE) {
+        if contains_table(&names, CHUNKS_TABLE) {
             let chunks = self
                 .db
                 .open_table(CHUNKS_TABLE)
@@ -312,9 +315,12 @@ impl Index {
                     size.value(row).max(0) as u64
                 };
                 let name = nms.value(row);
-                let is_text = (!media.is_null(row) && media.value(row) == "text/plain")
-                    || name.to_ascii_lowercase().ends_with(".ocr");
-                if is_text {
+                let media_type = if media.is_null(row) {
+                    None
+                } else {
+                    Some(media.value(row))
+                };
+                if crate::artifacts::is_text(name, media_type) {
                     sizes.text_logical_count += 1;
                     sizes.text_logical_bytes += bytes;
                     if ingested.contains(&(ids.value(row).to_string(), name.to_string())) {
@@ -329,7 +335,7 @@ impl Index {
         }
 
         // Real non-text bytes: sum the `size` column of stored raw artifacts.
-        if names.iter().any(|n| n == RAW_ARTIFACTS_TABLE) {
+        if contains_table(&names, RAW_ARTIFACTS_TABLE) {
             let raws = self
                 .db
                 .open_table(RAW_ARTIFACTS_TABLE)
@@ -780,7 +786,22 @@ pub(crate) fn sql_str(s: &str) -> String {
 /// list-then-membership-test guard the existence-checked paths share.
 pub(crate) async fn has_table(db: &Connection, name: &str) -> Result<bool> {
     let names = db.table_names().execute().await.context("listing tables")?;
-    Ok(names.iter().any(|n| n == name))
+    Ok(contains_table(&names, name))
+}
+
+/// True when a table named `name` is in an already-listed set of table names.
+/// Used by the paths that list once and test membership several times, where
+/// re-listing per check (as [`has_table`] does) would be wasteful.
+pub(crate) fn contains_table(names: &[String], name: &str) -> bool {
+    names.iter().any(|n| n == name)
+}
+
+/// Update `cur` to `candidate` when it is the greater string, tracking a
+/// running maximum (used for the high-water modified-date watermark).
+pub(crate) fn track_max(cur: &mut Option<String>, candidate: String) {
+    if cur.as_deref().is_none_or(|c| candidate.as_str() > c) {
+        *cur = Some(candidate);
+    }
 }
 
 /// Delete every row of `table` whose `column` value is in `ids`, issued in
@@ -824,10 +845,7 @@ pub(crate) async fn read_watermark(db: &Connection) -> Result<Option<String>> {
         let col = str_col(batch, WATERMARK_COL)?;
         for i in 0..col.len() {
             if !col.is_null(i) {
-                let v = col.value(i);
-                if max.as_deref().is_none_or(|cur| v > cur) {
-                    max = Some(v.to_string());
-                }
+                track_max(&mut max, col.value(i).to_string());
             }
         }
     }
@@ -989,13 +1007,23 @@ fn raw_artifact_from_batches(batches: &[RecordBatch]) -> Result<Option<RawArtifa
 }
 
 /// Downcast a named column to an [`Int64Array`].
-fn i64_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+pub(crate) fn i64_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
     batch
         .column_by_name(name)
         .ok_or_else(|| anyhow::anyhow!("result missing column {name}"))?
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| anyhow::anyhow!("column {name} is not an int64 column"))
+}
+
+/// Downcast a named column to an [`Int32Array`].
+pub(crate) fn i32_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow::anyhow!("result missing column {name}"))?
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| anyhow::anyhow!("column {name} is not an int32 column"))
 }
 
 /// Read a nullable string cell, mapping SQL null and the empty string to `None`.

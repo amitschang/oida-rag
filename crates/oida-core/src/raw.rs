@@ -32,7 +32,7 @@ use lancedb::{Connection, Table};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::index::{Index, RAW_ARTIFACTS_TABLE, RawArtifactRef, raw_refs_from_batch, str_col};
+use crate::index::{Index, RAW_ARTIFACTS_TABLE, RawArtifactRef, has_table, raw_refs_from_batch, str_col};
 use crate::ingest::connect;
 use crate::progress::{RawProgress, run_ticker};
 use crate::source::ArtifactSource;
@@ -106,8 +106,7 @@ pub(crate) async fn build_with_progress(
     })?;
 
     let db = connect(config).await?;
-    let existing = db.table_names().execute().await.context("listing tables")?;
-    let have_table = existing.iter().any(|n| n == RAW_ARTIFACTS_TABLE);
+    let have_table = has_table(&db, RAW_ARTIFACTS_TABLE).await?;
 
     if !resume && have_table {
         db.drop_table(RAW_ARTIFACTS_TABLE, &[])

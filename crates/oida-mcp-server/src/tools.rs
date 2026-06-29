@@ -9,7 +9,7 @@ use std::sync::Arc;
 use oida_core::artifacts::{ArtifactText, read_artifact_text};
 use oida_core::hybrid::HybridIndex;
 use oida_core::model::{Artifact, Document, HybridHit, RelatedEdge, SearchHit};
-use oida_core::{Config, Index, SearchParams, SqlQueryResult, TableSchema};
+use oida_core::{ArtifactSource, Index, SearchParams, SqlQueryResult, TableSchema};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -29,24 +29,30 @@ const MAX_DEPTH: u32 = 3;
 const DEFAULT_SQL_ROWS: u32 = 200;
 const MAX_SQL_ROWS: u32 = 2000;
 
-/// The MCP server state: a shared index plus configuration.
+/// The MCP server state: a shared index plus the artifact source.
 #[derive(Clone)]
 pub struct OidaServer {
     index: Arc<Index>,
-    config: Arc<Config>,
     /// The hybrid text index, present only when it has been built. Tools that
     /// need it return a helpful error when it is absent.
     hybrid: Arc<Option<HybridIndex>>,
+    /// The artifact byte source (local dir or S3), present only when one is
+    /// configured. `get_artifact_text` returns a status when it is absent.
+    source: Arc<Option<ArtifactSource>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 impl OidaServer {
-    pub fn new(index: Arc<Index>, config: Arc<Config>, hybrid: Option<HybridIndex>) -> Self {
+    pub fn new(
+        index: Arc<Index>,
+        hybrid: Option<HybridIndex>,
+        source: Option<ArtifactSource>,
+    ) -> Self {
         Self {
             index,
-            config,
             hybrid: Arc::new(hybrid),
+            source: Arc::new(source),
             tool_router: Self::tool_router(),
         }
     }
@@ -97,6 +103,9 @@ pub struct DocumentResponse {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetArtifactTextRequest {
+    /// Id of the document that owns the artifact (as returned by
+    /// `get_document`, `search_documents`, or `hybrid_search`).
+    pub id: String,
     /// Artifact file name (e.g. `thdb0402.ocr`), as listed by `get_document`.
     pub name: String,
     /// MIME type of the artifact, if known (helps decide readability).
@@ -224,7 +233,7 @@ impl OidaServer {
     /// Read text from an artifact file on disk.
     #[tool(
         description = "Read the text of an artifact (intended for .ocr / text/plain files) \
-        by file name. Returns a status: text_loaded, artifact_file_missing, \
+        by document id and file name. Returns a status: text_loaded, artifact_file_missing, \
         unsupported_artifact_type, or artifact_root_not_configured. Supports paging via \
         offset/max_bytes."
     )]
@@ -237,12 +246,14 @@ impl OidaServer {
             .unwrap_or(DEFAULT_TEXT_BYTES)
             .clamp(1, MAX_TEXT_BYTES);
         let result = read_artifact_text(
-            &self.config,
+            self.source.as_ref().as_ref(),
+            &req.id,
             &req.name,
             req.media_type.as_deref(),
             req.offset.unwrap_or(0),
             max_bytes,
-        );
+        )
+        .await;
         Ok(Json(result))
     }
 
