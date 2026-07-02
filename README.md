@@ -21,13 +21,25 @@ The project does two things:
 
 ## Architecture
 
-Three crates in a Cargo workspace:
+The project is split into a **corpus-agnostic framework** and a thin **domain
+crate** that adapts it to OIDA. Two crates in a Cargo workspace:
 
 | Crate | Role |
 |-------|------|
-| `oida-core` | Domain logic: config, the LanceDB dataset (ingest/update, search, relationship graph, hybrid text search, raw-blob store), and artifact access. Transport-agnostic. |
-| `oida-mcp-server` | An MCP server (via the official `rmcp` SDK) exposing the dataset as tools over **stdio**. |
-| `oida-cli` | Both the **dataset management** front-end (`ingest`, `stats`) and an MCP **client** that spawns the server and drives a local LLM tool-calling chat loop. |
+| `corpus-index` | The reusable engine, knowing nothing about any particular corpus: the LanceDB store (scalar + full-text/BM25 + vector indexes), the hybrid (RRF) search engine, the raw-artifact store and layered retrieval resolver, read-only SQL, and the ingest / incremental-apply drivers. Transport-agnostic by default; MCP server tools, the chat agent, and CLI helpers are opt-in cargo features (`mcp`, `chat`, `cli`). |
+| `oida` | The OIDA domain layer over `corpus-index`: the Solr `SourceProvider`, the document schema and relationship-graph queries, config slices — **plus the two OIDA binaries**, `oida-cli` and `oida-mcp-server`. It re-exports the framework so the binaries compose against a single `oida::` surface. |
+
+A new corpus is therefore a single small crate: implement a `SourceProvider`
+and a document row type against `corpus-index`, and reuse the search engine,
+MCP tools, and chat agent unchanged.
+
+The two binaries live in the `oida` crate (`crates/oida/src/bin/`):
+
+- **`oida-cli`** — the **dataset management** front-end (`ingest`, `stats`)
+  *and* an MCP **client** that spawns the server and drives a local LLM
+  tool-calling chat loop.
+- **`oida-mcp-server`** — an MCP server (via the official `rmcp` SDK) exposing
+  the dataset as tools over **stdio**.
 
 ```
  build / maintain                         query
@@ -37,6 +49,59 @@ Three crates in a Cargo workspace:
  artifacts├─► oida-cli ingest ─► LanceDB ◄─ oida-mcp-server ◄─ oida-cli chat ◄─► local LLM
  (disk/S3)┘                      dataset                                  (Ollama tool calling)
 ```
+
+Both binaries live in the `oida` package, so run them with
+`cargo run -p oida --bin oida-cli` (and `--bin oida-mcp-server`).
+
+### Writing a domain crate
+
+Everything corpus-specific lives in the `oida` crate; the framework supplies the
+rest. Adapting `corpus-index` to a different corpus means writing these elements
+— using [crates/oida/](crates/oida/) as the worked example:
+
+1. **A source provider** — implement [`SourceProvider`](crates/corpus-index/src/provider.rs)
+   to stream the corpus as pages of Arrow batches, and declare a
+   `DocumentsContract` (the `documents` schema, its FTS column, and the scalar
+   columns to index). The framework's `build_metadata` / `apply` drivers own
+   everything downstream (table writes, indexes, watermark, incremental diffing).
+   See [solr_provider.rs](crates/oida/src/solr_provider.rs) and the Solr mapping
+   in [solr_map.rs](crates/oida/src/solr_map.rs).
+
+2. **Document row types** — define your document structs and implement
+   [`DocumentRow`](crates/corpus-index/src/row.rs) (column list + decode from an
+   Arrow row) for each. A lean search projection additionally implements
+   `SearchableRow` to declare which fields are scored and how artifact types are
+   read. The generic `Index::get<D>` / `search<D>` / `documents_where<D>` are
+   parameterized over these. See [model.rs](crates/oida/src/model.rs).
+
+3. **Domain queries** — corpus concepts with no generic meaning (here: Bates
+   numbers, conversation threads, the reference graph) go in an *extension trait*
+   on the framework's `Index` — a trait, not inherent methods, because the orphan
+   rule forbids `impl`ing on a foreign type. Each is built from the generic query
+   primitives. See [`CorpusQueries`](crates/oida/src/queries.rs).
+
+4. **Config slices** — add your domain and app config structs and `serde(flatten)`
+   them alongside the framework's `CoreConfig` into one aggregate, so the on-disk
+   TOML stays flat while framework drivers still take only `&CoreConfig`. Corpus
+   branding (system prompt, assistant label) is config, not code. See
+   [config.rs](crates/oida/src/config.rs).
+
+5. **The MCP server** — implement the one-method
+   [`CorpusBackend`](crates/corpus-index/src/mcp.rs) trait (index / hybrid /
+   artifacts accessors) to inherit the generic tools (`search_documents`,
+   `hybrid_search`, `get_artifact_text`, `run_sql`, `describe_schema`), then merge
+   any domain-only tools with `ToolRouter`'s `+`. Tool descriptions naming corpus
+   fields are passed as parameters. See
+   [oida-mcp-server/tools.rs](crates/oida/src/bin/oida-mcp-server/tools.rs).
+
+6. **The chat agent** — nothing to write: the CLI calls the generic
+   `corpus_index::chat::run(ChatOptions { .. })` with the prompt, label, model,
+   and server binary pulled from config. See
+   [oida-cli.rs](crates/oida/src/bin/oida-cli.rs).
+
+The performance-critical paths (the per-chunk embed loop, the per-document
+mapping) stay monomorphic inside the provider impl; genericity is only at the I/O
+boundaries and cold result-materialization.
 
 ---
 
@@ -59,26 +124,26 @@ All management flows through `oida-cli ingest`:
 
 ```sh
 # First build: drop and rebuild documents/artifacts from a full Solr scan.
-cargo run --release -p oida-cli -- ingest --force
+cargo run --release -p oida --bin oida-cli -- ingest --force
 
 # Add the hybrid full-text (OCR) index and/or the raw-artifact blob store.
 # These are separate passes over the already-ingested artifacts, so they
 # compose with --force or with an incremental update.
-cargo run --release -p oida-cli -- ingest --force --full-text --store-raw
+cargo run --release -p oida --bin oida-cli -- ingest --force --full-text --store-raw
 
 # Incremental sync (the default with no mode flag, or --update): upsert
 # new/changed docs from the stored watermark, delete redactions, invalidate
 # stale chunks/raw rows, then resume the requested derived stores.
-cargo run --release -p oida-cli -- ingest --full-text --store-raw
+cargo run --release -p oida --bin oida-cli -- ingest --full-text --store-raw
 
 # Preview the incremental delta without writing anything.
-cargo run --release -p oida-cli -- ingest --dry-run
+cargo run --release -p oida --bin oida-cli -- ingest --dry-run
 
 # Inspect one full Solr document to understand the source schema.
-cargo run --release -p oida-cli -- ingest --sample-doc
+cargo run --release -p oida --bin oida-cli -- ingest --sample-doc
 
 # Report row counts, archive sizes, and full-text index metadata.
-cargo run --release -p oida-cli -- stats
+cargo run --release -p oida --bin oida-cli -- stats
 ```
 
 Key properties:
@@ -107,10 +172,10 @@ child process and drives a local Ollama tool-calling loop against it:
 
 ```sh
 # Interactive REPL
-cargo run --release -p oida-cli -- chat
+cargo run --release -p oida --bin oida-cli -- chat
 
 # One-shot question
-cargo run --release -p oida-cli -- chat --once \
+cargo run --release -p oida --bin oida-cli -- chat --once \
   "Find weekly retail reports and give me a document id and Bates number."
 ```
 
@@ -174,7 +239,7 @@ options (`chunk_bytes`, `chunk_overlap`, `write_buffer_bytes`,
   than via Ollama's native `tool_calls` field. The CLI parses both.
 - The agent loop has guardrails: a max number of tool-call rounds per turn,
   duplicate-call detection, and truncation of oversized tool results.
-- `cargo run -p oida-core --example smoke -- "your query"` exercises the core
+- `cargo run -p oida --example smoke -- "your query"` exercises the core
   search/document/graph paths directly against the dataset (no LLM), useful for
   validating it.
 </content>
