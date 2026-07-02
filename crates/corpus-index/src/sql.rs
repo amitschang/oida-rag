@@ -24,7 +24,7 @@ use futures::TryStreamExt;
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
-use datafusion::sql::sqlparser::ast::{Query, SetExpr, Statement as SqlStatement};
+use datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
 use lancedb::Table;
 use lancedb::table::datafusion::BaseTableAdapter;
 use serde_json::value::RawValue;
@@ -69,26 +69,14 @@ pub fn validate_sql(sql: &str) -> Result<(), String> {
 fn is_read_only(statement: &DfStatement) -> bool {
     match statement {
         DfStatement::Explain(explain) => is_read_only(&explain.statement),
-        DfStatement::Statement(inner) => is_read_only_sql(inner),
-        _ => false,
-    }
-}
-
-/// True if a standard sqlparser statement is one of the read-only kinds we
-/// allow: queries and schema introspection (`DESCRIBE`, `SHOW TABLES`,
-/// `SHOW COLUMNS`).
-fn is_read_only_sql(statement: &SqlStatement) -> bool {
-    match statement {
         // A query body can itself be a write (e.g. `WITH cte AS (..) INSERT
         // ..` parses as a query whose body is an INSERT), so inspect it.
-        SqlStatement::Query(query) => query_is_read_only(query),
+        DfStatement::Statement(inner) => match inner.as_ref() {
+            SqlStatement::Query(query) => set_expr_is_read_only(&query.body),
+            _ => false,
+        },
         _ => false,
     }
-}
-
-/// True if a `Query` (including any CTEs and set operations) only reads.
-fn query_is_read_only(query: &Query) -> bool {
-    set_expr_is_read_only(&query.body)
 }
 
 /// True if a query body contains no write/DML node.
@@ -98,7 +86,7 @@ fn query_is_read_only(query: &Query) -> bool {
 fn set_expr_is_read_only(body: &SetExpr) -> bool {
     match body {
         SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
-        SetExpr::Query(query) => query_is_read_only(query),
+        SetExpr::Query(query) => set_expr_is_read_only(&query.body),
         SetExpr::SetOperation { left, right, .. } => {
             set_expr_is_read_only(left) && set_expr_is_read_only(right)
         }

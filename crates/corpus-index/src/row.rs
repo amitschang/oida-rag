@@ -7,10 +7,6 @@
 //! [`get_many`](crate::index::Index::get_many), [`search`](crate::index::Index::search))
 //! are written against these traits, so the engine never names a concrete
 //! document type.
-//!
-//! The decode runs only at result materialization (a handful of rows per
-//! query), never in the ingest/embed hot loop, so monomorphizing the readers
-//! over `D` is free.
 
 use anyhow::Result;
 use arrow::array::RecordBatch;
