@@ -47,7 +47,7 @@ The two binaries live in the `oida` crate (`crates/oida/src/bin/`):
    Solr  ─┐                                you
           │                                 │
  artifacts├─► oida-cli ingest ─► LanceDB ◄─ oida-mcp-server ◄─ oida-cli chat ◄─► local LLM
- (disk/S3)┘                      dataset                                  (Ollama tool calling)
+ (disk/S3)┘                      dataset                          (OpenAI-compatible tool calling)
 ```
 
 Both binaries live in the `oida` package, so run them with
@@ -168,7 +168,8 @@ Key properties:
 ## 2. The research assistant (MCP server + chat)
 
 Once the dataset is built, chat with it. The CLI spawns the MCP server as a
-child process and drives a local Ollama tool-calling loop against it:
+child process and drives an OpenAI-compatible tool-calling loop against it
+(`chat_host` — a local Ollama by default, or a vLLM sidecar):
 
 ```sh
 # Interactive REPL
@@ -203,8 +204,9 @@ absent — the corresponding tools simply report that they are unavailable.
 - Rust (edition 2024).
 - A Solr source for the corpus (default query `industrycode:OPIOIDS`); set
   `solr_url`.
-- For chat: [Ollama](https://ollama.com) running locally with a tool-capable
-  model, e.g. `ollama pull qwen2.5-coder:latest`.
+- For chat: an OpenAI-compatible chat endpoint serving a tool-capable model —
+  [Ollama](https://ollama.com) running locally (`ollama pull
+  qwen2.5-coder:latest`) or a vLLM sidecar, set via `chat_host`.
 - For the full-text index: an OpenAI-compatible embedding endpoint and a model
   (e.g. `ollama pull nomic-embed-text`, or a vLLM sidecar).
 - For artifact text / raw storage: the artifact files on disk
@@ -224,8 +226,9 @@ flags. Copy `oida.toml.example` to `oida.toml` and edit.
 | S3 bucket / region / endpoint / prefix | `s3_*` | `OIDA_S3_*` | `--s3-*` |
 | Embedding host (OpenAI-compatible) | `embed_host` | `OIDA_EMBED_HOST` | `--embed-host` |
 | Embedding model | `embed_model` | `OIDA_EMBED_MODEL` | `--embed-model` |
-| Ollama host (chat) | `ollama_host` | `OIDA_OLLAMA_HOST` | `--ollama-host` |
-| Ollama model (chat) | `ollama_model` | `OIDA_MODEL` | `--model` |
+| Chat host (OpenAI-compatible) | `chat_host` | `OIDA_CHAT_HOST` | `--chat-host` |
+| Chat model | `chat_model` | `OIDA_CHAT_MODEL` | `--model` |
+| Chat API key (vLLM) | `chat_api_key` | `OIDA_CHAT_API_KEY` | `--chat-api-key` |
 
 See `oida.toml.example` for the full set, including chunking and build-tuning
 options (`chunk_bytes`, `chunk_overlap`, `write_buffer_bytes`,
@@ -236,7 +239,8 @@ options (`chunk_bytes`, `chunk_overlap`, `write_buffer_bytes`,
 ## Notes
 
 - Some models (including `qwen2.5-coder`) emit tool calls as JSON text rather
-  than via Ollama's native `tool_calls` field. The CLI parses both.
+  than via the native `tool_calls` field (a model-template quirk, independent of
+  the server). The CLI parses both.
 - The agent loop has guardrails: a max number of tool-call rounds per turn,
   duplicate-call detection, and truncation of oversized tool results.
 - `cargo run -p oida --example smoke -- "your query"` exercises the core

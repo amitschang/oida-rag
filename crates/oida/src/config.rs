@@ -6,10 +6,12 @@ use std::path::Path;
 use corpus_index::CoreConfig;
 use serde::{Deserialize, Serialize};
 
-/// Default Ollama model used to drive tool calling.
+/// Default model used to drive tool calling.
 pub const DEFAULT_MODEL: &str = "qwen2.5-coder:latest";
-/// Default Ollama HTTP endpoint (used for the chat agent).
-pub const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
+/// Default OpenAI-compatible chat endpoint (Ollama's `/v1` layer by default;
+/// point it at a vLLM sidecar, e.g. `http://localhost:8000`, to serve chat
+/// there).
+pub const DEFAULT_CHAT_HOST: &str = "http://localhost:11434";
 /// Default Solr `q` selecting the tracked corpus for incremental updates.
 pub const DEFAULT_SOLR_QUERY: &str = "industrycode:OPIOIDS";
 /// Default rows per Solr page (cursorMark paging) during an update.
@@ -65,10 +67,15 @@ impl Default for SolrConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatConfig {
-    /// Base URL of the Ollama server (the chat agent).
-    pub ollama_host: String,
-    /// Ollama model name used by the CLI agent.
-    pub ollama_model: String,
+    /// Base URL of the OpenAI-compatible chat server (the chat agent). Defaults
+    /// to a local Ollama; point it at a vLLM sidecar for higher throughput.
+    pub chat_host: String,
+    /// Optional bearer token for the chat server, sent as `Authorization:
+    /// Bearer`. Needed only for a locked-down vLLM (`--api-key`); Ollama ignores
+    /// it. Prefer setting it via the `OIDA_CHAT_API_KEY` env var over the file.
+    pub chat_api_key: Option<String>,
+    /// Chat model name used by the CLI agent.
+    pub chat_model: String,
     /// System prompt establishing the assistant's role and tool workflow. The
     /// generic agent loop takes this verbatim — the OIDA-specific wording is a
     /// config value, not code.
@@ -81,8 +88,9 @@ pub struct ChatConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
-            ollama_host: DEFAULT_OLLAMA_HOST.to_string(),
-            ollama_model: DEFAULT_MODEL.to_string(),
+            chat_host: DEFAULT_CHAT_HOST.to_string(),
+            chat_api_key: None,
+            chat_model: DEFAULT_MODEL.to_string(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             assistant_label: DEFAULT_ASSISTANT_LABEL.to_string(),
         }
@@ -136,14 +144,14 @@ mod tests {
             embed_host = "http://vllm:8000"
             solr_url = "https://example/solr/ltdl3"
             solr_page_rows = 500
-            ollama_model = "qwen2.5-coder:latest"
+            chat_model = "qwen2.5-coder:latest"
         "#;
         let cfg: OidaConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.core.lance_path, std::path::PathBuf::from("/data/idx"));
         assert_eq!(cfg.core.embed_host, "http://vllm:8000");
         assert_eq!(cfg.solr.solr_url.as_deref(), Some("https://example/solr/ltdl3"));
         assert_eq!(cfg.solr.solr_page_rows, 500);
-        assert_eq!(cfg.chat.ollama_model, "qwen2.5-coder:latest");
+        assert_eq!(cfg.chat.chat_model, "qwen2.5-coder:latest");
         // Untouched keys keep their slice defaults.
         assert_eq!(cfg.core.chunk_bytes, corpus_index::config::DEFAULT_CHUNK_BYTES);
         assert_eq!(cfg.solr.solr_modified_field, DEFAULT_SOLR_MODIFIED_FIELD);

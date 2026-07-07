@@ -1,8 +1,8 @@
 //! OIDA assistant CLI.
 //!
-//! Connects to the OIDA MCP server (spawned as a child process) and drives a
-//! local Ollama model that calls the server's tools to answer questions about
-//! the document archive.
+//! Connects to the OIDA MCP server (spawned as a child process) and drives an
+//! OpenAI-compatible chat model (a local Ollama or a vLLM sidecar) that calls
+//! the server's tools to answer questions about the document archive.
 
 use std::path::PathBuf;
 
@@ -95,13 +95,18 @@ struct ChatArgs {
     #[arg(long)]
     once: Option<String>,
 
-    /// Ollama model to use for the chat agent (overrides config).
-    #[arg(long, env = "OIDA_MODEL")]
+    /// Chat model to use for the agent (overrides config).
+    #[arg(long, env = "OIDA_CHAT_MODEL")]
     model: Option<String>,
 
-    /// Ollama host URL for the chat agent (overrides config).
-    #[arg(long, env = "OIDA_OLLAMA_HOST")]
-    ollama_host: Option<String>,
+    /// OpenAI-compatible chat host URL for the agent, e.g. a local Ollama
+    /// (`http://localhost:11434`) or a vLLM sidecar (`http://localhost:8000`).
+    #[arg(long, env = "OIDA_CHAT_HOST")]
+    chat_host: Option<String>,
+
+    /// Bearer token for the chat host (only for a locked-down vLLM).
+    #[arg(long, env = "OIDA_CHAT_API_KEY")]
+    chat_api_key: Option<String>,
 
     /// Path to the oida-mcp-server binary (defaults to a sibling of this exe).
     #[arg(long, env = "OIDA_SERVER_BIN")]
@@ -279,10 +284,13 @@ impl ChatArgs {
     /// Overlay the `chat` flags onto the chat config slice.
     fn overlay(&self, c: &mut ChatConfig) {
         if let Some(m) = &self.model {
-            c.ollama_model = m.clone();
+            c.chat_model = m.clone();
         }
-        if let Some(h) = &self.ollama_host {
-            c.ollama_host = h.clone();
+        if let Some(h) = &self.chat_host {
+            c.chat_host = h.clone();
+        }
+        if let Some(k) = &self.chat_api_key {
+            c.chat_api_key = Some(k.clone());
         }
     }
 }
@@ -421,8 +429,9 @@ async fn run_chat(config: &OidaConfig, args: &ChatArgs) -> anyhow::Result<()> {
 
     chat::run(ChatOptions {
         server_bin: resolve_server_bin(args.server_bin.clone())?,
-        ollama_host: config.chat.ollama_host.clone(),
-        model: config.chat.ollama_model.clone(),
+        chat_host: config.chat.chat_host.clone(),
+        chat_api_key: config.chat.chat_api_key.clone(),
+        model: config.chat.chat_model.clone(),
         system_prompt: config.chat.system_prompt.clone(),
         label: config.chat.assistant_label.clone(),
         once: args.once.clone(),

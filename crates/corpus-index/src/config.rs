@@ -85,7 +85,7 @@ pub struct CoreConfig {
     pub artifact_root: Option<PathBuf>,
     /// Base URL of the OpenAI-compatible server used for embeddings. Kept
     /// separate from the chat host so embeddings can be served by a faster
-    /// sidecar (e.g. vLLM) while chat stays on Ollama.
+    /// sidecar (e.g. vLLM) independently of where chat runs.
     ///
     /// May be a comma-separated list of replica addresses serving the same model;
     /// requests are then balanced across them by least connections (client-side,

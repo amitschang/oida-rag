@@ -1,16 +1,17 @@
-//! Generic Ollama + MCP-tools chat agent (`feature = "chat"`).
+//! Generic OpenAI-compatible chat agent + MCP tools (`feature = "chat"`).
 //!
 //! Engine-independent: it spawns an MCP server subprocess, advertises whatever
-//! tools that server exposes, and drives an Ollama model that calls them. A
-//! corpus's chat CLI supplies only branding and endpoints — the system prompt,
-//! a label, the server binary, and the Ollama host/model — via [`ChatOptions`]
-//! and calls [`run`].
+//! tools that server exposes, and drives an OpenAI-compatible model (Ollama's
+//! `/v1` layer, vLLM, or any compatible server) that calls them. A corpus's chat
+//! CLI supplies only branding and endpoints — the system prompt, a label, the
+//! server binary, and the chat host/model — via [`ChatOptions`] and calls
+//! [`run`].
 
 use std::path::PathBuf;
 
 pub mod agent;
 pub mod mcp_client;
-pub mod ollama;
+pub mod openai;
 pub mod repl;
 
 pub use agent::Agent;
@@ -21,9 +22,12 @@ pub use mcp_client::McpClient;
 pub struct ChatOptions {
     /// Path to the MCP server binary to spawn.
     pub server_bin: PathBuf,
-    /// Base URL of the Ollama server driving the conversation.
-    pub ollama_host: String,
-    /// Ollama model name.
+    /// Base URL of the OpenAI-compatible chat server driving the conversation.
+    pub chat_host: String,
+    /// Optional bearer token for the chat server (needed only for a locked-down
+    /// vLLM launched with `--api-key`).
+    pub chat_api_key: Option<String>,
+    /// Chat model name.
     pub model: String,
     /// System prompt establishing the assistant's role and tool workflow.
     pub system_prompt: String,
@@ -46,7 +50,14 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<()> {
     let tools = mcp.list_tools().await?;
     repl::print_tools(&tools, &opts.label);
 
-    let agent = Agent::new(&opts.ollama_host, opts.model.clone(), opts.system_prompt, mcp, &tools)?;
+    let agent = Agent::new(
+        &opts.chat_host,
+        opts.chat_api_key,
+        opts.model.clone(),
+        opts.system_prompt,
+        mcp,
+        &tools,
+    )?;
     eprintln!("Using model: {}\n", opts.model);
 
     let result = if let Some(query) = opts.once {

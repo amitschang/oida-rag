@@ -1,5 +1,5 @@
-//! The agent loop: drives an Ollama model that calls MCP tools until it
-//! produces a final answer.
+//! The agent loop: drives an OpenAI-compatible model that calls MCP tools until
+//! it produces a final answer.
 
 use std::collections::HashSet;
 
@@ -8,19 +8,29 @@ use rmcp::model::Tool;
 use serde_json::{Map, Value};
 
 use super::mcp_client::McpClient;
-use super::ollama::{ChatMessage, Ollama, ToolFunctionInfo, ToolInfo, ToolType};
+use super::openai::{ChatMessage, OpenAiChat, ToolFunctionInfo, ToolInfo, ToolType};
 
 /// Maximum tool-calling rounds per user turn (loop guard).
 const MAX_ITERATIONS: usize = 8;
 /// Tool results longer than this are truncated before being sent back.
 const MAX_TOOL_RESULT_CHARS: usize = 6000;
 
-/// Orchestrates conversation turns against Ollama with MCP-backed tools.
+/// One tool call the model asked for: the server-assigned id (absent when the
+/// call was recovered from message text rather than the native `tool_calls`
+/// field), the tool name, and its parsed arguments.
+struct ToolCallReq {
+    id: Option<String>,
+    name: String,
+    args: Value,
+}
+
+/// Orchestrates conversation turns against an OpenAI-compatible chat server with
+/// MCP-backed tools.
 ///
 /// The loop is corpus-agnostic; the domain wording enters only through the
 /// caller-supplied `system_prompt`.
 pub struct Agent {
-    ollama: Ollama,
+    chat: OpenAiChat,
     model: String,
     system_prompt: String,
     tools: Vec<ToolInfo>,
@@ -29,22 +39,24 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Build an agent from a configured Ollama endpoint and MCP tool list. The
+    /// Build an agent from a configured chat endpoint and MCP tool list. The
     /// `system_prompt` establishes the assistant's role and is supplied by the
-    /// app (config), not baked into the loop.
+    /// app (config), not baked into the loop. `api_key`, when set, is sent as a
+    /// bearer token (needed only for a locked-down vLLM).
     pub fn new(
-        ollama_host: &str,
+        chat_host: &str,
+        api_key: Option<String>,
         model: String,
         system_prompt: String,
         mcp: McpClient,
         mcp_tools: &[Tool],
     ) -> anyhow::Result<Self> {
-        let ollama = Ollama::try_new(ollama_host)
-            .with_context(|| format!("invalid ollama host {ollama_host}"))?;
+        let chat = OpenAiChat::try_new(chat_host, api_key)
+            .with_context(|| format!("invalid chat host {chat_host}"))?;
         let tools: Vec<ToolInfo> = mcp_tools.iter().map(to_tool_info).collect();
         let tool_names = tools.iter().map(|t| t.function.name.clone()).collect();
         Ok(Self {
-            ollama,
+            chat,
             model,
             system_prompt,
             tools,
@@ -71,23 +83,32 @@ impl Agent {
 
         for _ in 0..MAX_ITERATIONS {
             let message = self
-                .ollama
+                .chat
                 .chat(&self.model, history, &self.tools)
                 .await
-                .context("ollama chat request failed")?;
+                .context("chat request failed")?;
             history.push(message.clone());
 
             let calls = collect_tool_calls(&message, &self.tool_names);
             if calls.is_empty() {
-                return Ok(message.content);
+                return Ok(message.text().to_string());
             }
 
-            for (name, args) in &calls {
+            for call in &calls {
                 let result = self
-                    .dispatch(name, as_object(args.clone()), &mut seen_calls)
+                    .dispatch(&call.name, as_object(call.args.clone()), &mut seen_calls)
                     .await;
-                eprintln!("  [tool] {name} -> {} chars", result.len());
-                history.push(ChatMessage::tool(result));
+                eprintln!("  [tool] {} -> {} chars", call.name, result.len());
+                // Native calls carry an id, so the result goes back as a `tool`
+                // message correlated to it. Calls recovered from message text
+                // have no id (the assistant message had no native `tool_calls`
+                // for a `tool` reply to reference), so feed the result back as a
+                // plain user message the model can read.
+                let reply = match &call.id {
+                    Some(id) => ChatMessage::tool(result, id.clone()),
+                    None => ChatMessage::user(format!("Result of {}:\n{result}", call.name)),
+                };
+                history.push(reply);
             }
         }
 
@@ -147,23 +168,32 @@ fn as_object(value: Value) -> Map<String, Value> {
 
 /// Gather tool calls from a model message.
 ///
-/// Prefers Ollama's native `tool_calls`. Some models (e.g. qwen2.5-coder)
-/// instead emit the call as JSON text in `content`; we parse that as a
-/// fallback so tool use works regardless of the model's template.
-fn collect_tool_calls(message: &ChatMessage, known: &HashSet<String>) -> Vec<(String, Value)> {
-    let native: Vec<(String, Value)> = message
+/// Prefers the native `tool_calls` field, parsing each call's JSON-encoded
+/// `arguments` string into a value. Some models (e.g. qwen2.5-coder) instead
+/// emit the call as JSON text in `content` when the server has no tool-call
+/// parser configured; we parse that as a fallback so tool use works regardless
+/// of the model's template (this is model behaviour, not server-specific).
+fn collect_tool_calls(message: &ChatMessage, known: &HashSet<String>) -> Vec<ToolCallReq> {
+    let native: Vec<ToolCallReq> = message
         .tool_calls
         .iter()
-        .map(|c| (c.function.name.clone(), c.function.arguments.clone()))
+        .map(|c| ToolCallReq {
+            id: c.id.clone(),
+            name: c.function.name.clone(),
+            // Arguments are a JSON-encoded string; parse it, tolerating an empty
+            // or malformed string by falling back to null (→ empty arg object).
+            args: serde_json::from_str(&c.function.arguments).unwrap_or(Value::Null),
+        })
         .collect();
     if !native.is_empty() {
         return native;
     }
-    parse_tool_calls_from_text(&message.content, known)
+    parse_tool_calls_from_text(message.text(), known)
 }
 
 /// Best-effort extraction of `{ "name", "arguments" }` tool calls from text.
-fn parse_tool_calls_from_text(content: &str, known: &HashSet<String>) -> Vec<(String, Value)> {
+/// These carry no id (there is no native call to correlate against).
+fn parse_tool_calls_from_text(content: &str, known: &HashSet<String>) -> Vec<ToolCallReq> {
     let Some(value) = extract_json(content) else {
         return Vec::new();
     };
@@ -173,7 +203,7 @@ fn parse_tool_calls_from_text(content: &str, known: &HashSet<String>) -> Vec<(St
 }
 
 /// Recursively pull tool-call objects out of a JSON value.
-fn collect_from_value(value: &Value, known: &HashSet<String>, out: &mut Vec<(String, Value)>) {
+fn collect_from_value(value: &Value, known: &HashSet<String>, out: &mut Vec<ToolCallReq>) {
     match value {
         Value::Array(items) => {
             for item in items {
@@ -198,7 +228,11 @@ fn collect_from_value(value: &Value, known: &HashSet<String>, out: &mut Vec<(Str
                     .or_else(|| map.get("parameters"))
                     .cloned()
                     .unwrap_or(Value::Object(Map::new()));
-                out.push((name.clone(), args));
+                out.push(ToolCallReq {
+                    id: None,
+                    name: name.clone(),
+                    args,
+                });
             }
         }
         _ => {}
@@ -239,7 +273,7 @@ fn truncate(mut text: String) -> String {
     text
 }
 
-/// Convert an MCP tool definition into an Ollama tool definition.
+/// Convert an MCP tool definition into an OpenAI tool definition.
 fn to_tool_info(tool: &Tool) -> ToolInfo {
     ToolInfo {
         tool_type: ToolType::Function,
@@ -273,8 +307,9 @@ mod tests {
             &known(),
         );
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "search_documents");
-        assert_eq!(calls[0].1["query"], "opioid");
+        assert_eq!(calls[0].name, "search_documents");
+        assert_eq!(calls[0].args["query"], "opioid");
+        assert!(calls[0].id.is_none(), "text-parsed calls carry no id");
     }
 
     #[test]
@@ -283,7 +318,7 @@ mod tests {
             \"arguments\": {\"id\": \"thdb0402\"}}\n```";
         let calls = parse_tool_calls_from_text(content, &known());
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "get_document");
+        assert_eq!(calls[0].name, "get_document");
     }
 
     #[test]
@@ -293,7 +328,7 @@ mod tests {
             &known(),
         );
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1["query"], "x");
+        assert_eq!(calls[0].args["query"], "x");
     }
 
     #[test]

@@ -6,9 +6,15 @@
 # will report `artifact_root_not_configured` and degrade gracefully.
 # artifact_root = "/path/to/artifacts"
 
-# Local Ollama endpoint and model used to drive tool calling.
-ollama_host = "http://localhost:11434"
-ollama_model = "qwen2.5-coder:latest"
+# OpenAI-compatible chat endpoint and model used to drive tool calling.
+# Defaults to a local Ollama (via its `/v1` compatibility layer); point it at a
+# vLLM sidecar (e.g. "http://localhost:8000") to serve chat there instead.
+chat_host = "http://localhost:11434"
+chat_model = "qwen2.5-coder:latest"
+
+# Bearer token for the chat host, only needed for a vLLM launched with
+# `--api-key`. Prefer the OIDA_CHAT_API_KEY env var over storing it here.
+# chat_api_key = "sk-..."
 
 # LanceDB database directory. Holds the document/artifact metadata tables
 # (`oida-cli ingest --force`) and, when built, the hybrid keyword + semantic
