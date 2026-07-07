@@ -43,8 +43,9 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("== get_document: {target} ==");
         if let Some(doc) = index.get_document_by_id(&target).await? {
             println!(
-                "doc id={} bn={:?} authors={:?} attachments={:?} conversation={:?}",
-                doc.id, doc.bn, doc.authors, doc.attachments, doc.conversation
+                "doc id={} bn={:?} authors={:?} conversation={:?}\n  attachments={:?}\n  related={:?}\n  mentions={:?}",
+                doc.id, doc.bn, doc.authors, doc.conversation,
+                doc.attachments, doc.related, doc.mentions,
             );
             for a in index.get_artifacts(&doc.id).await? {
                 println!(
@@ -57,17 +58,17 @@ async fn main() -> anyhow::Result<()> {
         }
 
         eprintln!("== related (depth 1): {target} ==");
-        let edges = index.related(&target, 1).await?;
-        for e in edges.iter().take(10) {
+        let graph = index.related(&target, 1).await?;
+        for e in graph.edges.iter().take(10) {
             println!(
                 "  {} -> {} ({}) neighbor={:?}",
                 e.from_id,
                 e.reference,
                 e.kind.as_str(),
-                e.neighbor.as_ref().map(|n| n.id.clone())
+                e.neighbor_id,
             );
         }
-        println!("  ({} edges total)", edges.len());
+        println!("  ({} edges, {} nodes)", graph.edges.len(), graph.nodes.len());
     }
 
     Ok(())

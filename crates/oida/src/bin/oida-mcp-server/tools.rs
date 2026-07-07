@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use corpus_index::mcp::{CorpusBackend, generic_router, hybrid_route, search_route};
-use oida::{Artifact, ArtifactReader, CorpusQueries, Document, DocumentSummary, HybridIndex, Index, RelatedEdge};
+use oida::{Artifact, ArtifactReader, CorpusQueries, Document, DocumentSummary, HybridIndex, Index, RelatedGraph};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -107,8 +107,8 @@ pub struct GetRelatedRequest {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct RelatedResponse {
-    pub count: usize,
-    pub edges: Vec<RelatedEdge>,
+    pub edge_count: usize,
+    pub graph: RelatedGraph,
 }
 
 /// Convert an `anyhow` error into an MCP internal error.
@@ -154,19 +154,22 @@ impl OidaServer {
 
     /// Traverse the document relationship graph.
     #[tool(
-        description = "Find documents connected to a starting document (by id or Bates \
-        number) through attachments, related references, mentions, or shared email \
-        conversation. Returns typed edges with resolved neighbor documents."
+        description = "Find documents connected to a starting document (by id or Bates number) \
+        through attachments, related references, mentions, or shared email conversation. \
+        `depth` controls how many hops to traverse (1 = direct neighbors only, max 3; defaults \
+        to 1). Returns a graph with two fields: `nodes` (a map of document id to full document \
+        metadata for every resolved document in the graph) and `edges` (a list of typed \
+        relationships, each with `from_id`, `kind`, `reference`, `neighbor_id`, and `depth`)."
     )]
     async fn get_related(
         &self,
         Parameters(req): Parameters<GetRelatedRequest>,
     ) -> Result<Json<RelatedResponse>, McpError> {
         let depth = req.depth.unwrap_or(1).clamp(1, MAX_DEPTH);
-        let edges: Vec<RelatedEdge> = self.index.related(&req.start, depth).await.map_err(internal)?;
+        let graph = self.index.related(&req.start, depth).await.map_err(internal)?;
         Ok(Json(RelatedResponse {
-            count: edges.len(),
-            edges,
+            edge_count: graph.edges.len(),
+            graph,
         }))
     }
 }

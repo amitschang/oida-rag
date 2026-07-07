@@ -222,15 +222,27 @@ impl RelationKind {
 
 /// An edge in the document relationship graph.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct RelatedEdge {
+pub struct GraphEdge {
     /// Document id the edge originates from.
     pub from_id: String,
     /// Relationship type.
     pub kind: RelationKind,
     /// The Bates/conversation reference that produced this edge.
     pub reference: String,
-    /// Resolved neighbor document, if one exists in the index.
-    pub neighbor: Option<Document>,
+    /// Id of the resolved neighbor in `RelatedGraph::nodes`, if it exists in the index.
+    pub neighbor_id: Option<String>,
     /// BFS depth at which this edge was discovered (1 = direct).
     pub depth: u32,
+}
+
+/// A document relationship graph returned by [`CorpusQueries::related`].
+///
+/// Nodes are deduplicated: a document referenced by multiple edges appears once
+/// in `nodes` and is pointed to by `neighbor_id` on each edge.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RelatedGraph {
+    /// All resolved documents in the graph, keyed by document id.
+    pub nodes: std::collections::HashMap<String, Document>,
+    /// Typed edges discovered during BFS traversal.
+    pub edges: Vec<GraphEdge>,
 }

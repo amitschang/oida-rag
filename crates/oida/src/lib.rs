@@ -16,7 +16,7 @@ pub mod update;
 
 // Domain public API.
 pub use config::{ChatConfig, OidaConfig, SolrConfig};
-pub use model::{Document, DocumentSummary, RelatedEdge, RelationKind};
+pub use model::{Document, DocumentSummary, GraphEdge, RelatedGraph, RelationKind};
 pub use queries::CorpusQueries;
 pub use solr_provider::SolrProvider;
 
