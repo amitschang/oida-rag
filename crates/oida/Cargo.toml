@@ -7,9 +7,11 @@ license.workspace = true
 # The OIDA domain crate: the library (Solr provider, document schema, graph
 # queries) plus the two OIDA binaries. A provider is thus one small crate against
 # the `corpus-index` framework; the features it enables are the ones its binaries
-# need (MCP server tools, the chat agent, and the CLI helpers).
+# need (MCP server tools and the CLI helpers). The chat agent lives in the generic
+# `mcp-chat` crate.
 [dependencies]
-corpus-index = { workspace = true, features = ["mcp", "chat", "cli"] }
+corpus-index = { workspace = true, features = ["mcp", "cli"] }
+mcp-chat = { workspace = true }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

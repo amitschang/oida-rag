@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/corpus-index",
+    "crates/mcp-chat",
     "crates/oida",
 ]
 
@@ -12,6 +13,7 @@ license = "MIT"
 
 [workspace.dependencies]
 corpus-index = { path = "crates/corpus-index" }
+mcp-chat = { path = "crates/mcp-chat" }
 oida = { path = "crates/oida" }
 
 anyhow = "1"
@@ -37,6 +39,7 @@ futures = "0.3"
 indicatif = "0.18"
 rmcp = "1"
 reqwest = { version = "0.12", features = ["json"] }
+http = "1"
 clap = { version = "4", features = ["derive", "env"] }
 rustyline = "17"
 toml = "0.9"

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
-use corpus_index::chat::{self, ChatOptions};
 use corpus_index::cli;
+use mcp_chat::{ChatOptions, McpServer};
 use oida::{ChatConfig, CoreConfig, Index, OidaConfig, SolrConfig, apply, ingest, update};
 
 /// CLI arguments. Flags override config-file and environment values.
@@ -414,8 +414,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// Run the `chat` subcommand: connect to the MCP server and drive the agent,
 /// either interactively or for a single `--once` query. The agent loop, MCP
-/// client, and REPL are the framework's generic [`chat`] layer; the CLI supplies
-/// only the branding, endpoints, and server binary.
+/// client, and REPL are the generic `mcp-chat` crate; the CLI supplies only the
+/// branding, endpoints, and server binary.
 async fn run_chat(config: &OidaConfig, args: &ChatArgs) -> anyhow::Result<()> {
     // Chatting requires an ingested index; never build it implicitly.
     if !Index::is_ingested(&config.core).await {
@@ -427,8 +427,12 @@ async fn run_chat(config: &OidaConfig, args: &ChatArgs) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    chat::run(ChatOptions {
-        server_bin: resolve_server_bin(args.server_bin.clone())?,
+    mcp_chat::run(ChatOptions {
+        servers: vec![McpServer::Stdio {
+            bin: resolve_server_bin(args.server_bin.clone())?,
+            args: Vec::new(),
+            env: Vec::new(),
+        }],
         chat_host: config.chat.chat_host.clone(),
         chat_api_key: config.chat.chat_api_key.clone(),
         model: config.chat.chat_model.clone(),

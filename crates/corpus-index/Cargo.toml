@@ -9,10 +9,6 @@ license.workspace = true
 # (over the `CorpusBackend` trait). Off by default so the engine stays
 # transport-agnostic for consumers that don't serve MCP.
 mcp = ["dep:rmcp", "rmcp/server", "rmcp/schemars"]
-# Optional MCP *client* chat agent: an OpenAI-compatible, MCP-tools REPL. Engine-
-# independent (talks to any MCP server subprocess); gated so its client deps
-# don't burden non-chat consumers.
-chat = ["dep:rmcp", "rmcp/client", "rmcp/transport-child-process", "dep:rustyline"]
 # Optional CLI operation helpers (embedder, derived builds, stats) over the
 # engine — no extra deps, just an opt-in module for corpus command lines.
 cli = []
@@ -26,7 +22,6 @@ serde_json.workspace = true
 tracing.workspace = true
 schemars.workspace = true
 rmcp = { workspace = true, optional = true }
-rustyline = { workspace = true, optional = true }
 lancedb.workspace = true
 lance.workspace = true
 datafusion.workspace = true

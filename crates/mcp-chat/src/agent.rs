@@ -1,9 +1,16 @@
 //! The agent loop: drives an OpenAI-compatible model that calls MCP tools until
 //! it produces a final answer.
+//!
+//! Tools may come from more than one MCP server. When a single server is
+//! connected, tools are advertised to the model under their bare names (so a
+//! system prompt can reference them directly). When two or more servers are
+//! connected, each tool is advertised as `{namespace}__{tool}` to keep names
+//! from colliding across servers; the [`Agent`] routes an advertised name back
+//! to the owning client and its bare name at call time.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
-use anyhow::Context;
 use rmcp::model::Tool;
 use serde_json::{Map, Value};
 
@@ -14,6 +21,29 @@ use super::openai::{ChatMessage, OpenAiChat, ToolFunctionInfo, ToolInfo, ToolTyp
 const MAX_ITERATIONS: usize = 8;
 /// Tool results longer than this are truncated before being sent back.
 const MAX_TOOL_RESULT_CHARS: usize = 6000;
+/// OpenAI caps function names at 64 chars; a namespaced name over this is likely
+/// to be rejected by the server, so we warn rather than silently truncate (which
+/// would break routing).
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// One connected MCP server and the tools it advertises.
+pub struct ServerTools {
+    /// Namespace slug used to disambiguate this server's tool names when more
+    /// than one server is connected.
+    pub namespace: String,
+    /// The connected client.
+    pub client: McpClient,
+    /// The tools this server advertises.
+    pub tools: Vec<Tool>,
+}
+
+/// Where an advertised tool name routes: which client backs it and the bare name
+/// to call on that client (the advertised name may be namespaced; the server
+/// only knows its own bare name).
+struct ToolEntry {
+    client_idx: usize,
+    real_name: String,
+}
 
 /// One tool call the model asked for: the server-assigned id (absent when the
 /// call was recovered from message text rather than the native `tool_calls`
@@ -25,43 +55,83 @@ struct ToolCallReq {
 }
 
 /// Orchestrates conversation turns against an OpenAI-compatible chat server with
-/// MCP-backed tools.
+/// MCP-backed tools drawn from one or more servers.
 ///
-/// The loop is corpus-agnostic; the domain wording enters only through the
-/// caller-supplied `system_prompt`.
+/// The loop is domain-agnostic; the domain wording enters only through the
+/// caller-supplied `system_prompt` and the tools the connected servers expose.
 pub struct Agent {
     chat: OpenAiChat,
     model: String,
     system_prompt: String,
+    /// Tool definitions advertised to the model, under their advertised (bare or
+    /// namespaced) names.
     tools: Vec<ToolInfo>,
+    /// Advertised name → owning client + bare name.
+    route: HashMap<String, ToolEntry>,
+    /// The advertised names, used to recognise tool calls emitted as message text.
     tool_names: HashSet<String>,
-    mcp: McpClient,
+    /// Connected clients, indexed by [`ToolEntry::client_idx`].
+    clients: Vec<McpClient>,
 }
 
 impl Agent {
-    /// Build an agent from a configured chat endpoint and MCP tool list. The
-    /// `system_prompt` establishes the assistant's role and is supplied by the
-    /// app (config), not baked into the loop. `api_key`, when set, is sent as a
-    /// bearer token (needed only for a locked-down vLLM).
+    /// Build an agent from a configured chat endpoint and one or more connected
+    /// MCP servers. The `system_prompt` establishes the assistant's role and is
+    /// supplied by the app (config), not baked into the loop. `api_key`, when
+    /// set, is sent as a bearer token (needed only for a locked-down chat host).
+    ///
+    /// With a single server, tools keep their bare names; with several, each is
+    /// advertised as `{namespace}__{tool}`.
     pub fn new(
         chat_host: &str,
         api_key: Option<String>,
         model: String,
         system_prompt: String,
-        mcp: McpClient,
-        mcp_tools: &[Tool],
+        servers: Vec<ServerTools>,
     ) -> anyhow::Result<Self> {
-        let chat = OpenAiChat::try_new(chat_host, api_key)
-            .with_context(|| format!("invalid chat host {chat_host}"))?;
-        let tools: Vec<ToolInfo> = mcp_tools.iter().map(to_tool_info).collect();
-        let tool_names = tools.iter().map(|t| t.function.name.clone()).collect();
+        let chat = OpenAiChat::try_new(chat_host, api_key)?;
+        let namespaced = servers.len() > 1;
+
+        let mut tools = Vec::new();
+        let mut route: HashMap<String, ToolEntry> = HashMap::new();
+        let mut clients = Vec::with_capacity(servers.len());
+
+        for server in servers {
+            let client_idx = clients.len();
+            for tool in &server.tools {
+                let real_name = tool.name.to_string();
+                let advertised = if namespaced {
+                    format!("{}__{real_name}", server.namespace)
+                } else {
+                    real_name.clone()
+                };
+                if advertised.len() > MAX_TOOL_NAME_LEN {
+                    tracing::warn!(
+                        tool = %advertised,
+                        "advertised tool name exceeds {MAX_TOOL_NAME_LEN} chars; the model may reject it — use a shorter server namespace"
+                    );
+                }
+                if route.contains_key(&advertised) {
+                    tracing::warn!(
+                        tool = %advertised,
+                        "duplicate advertised tool name across servers; the later one wins"
+                    );
+                }
+                tools.push(to_tool_info(tool, &advertised));
+                route.insert(advertised, ToolEntry { client_idx, real_name });
+            }
+            clients.push(server.client);
+        }
+
+        let tool_names = route.keys().cloned().collect();
         Ok(Self {
             chat,
             model,
             system_prompt,
             tools,
+            route,
             tool_names,
-            mcp,
+            clients,
         })
     }
 
@@ -82,11 +152,7 @@ impl Agent {
         let mut seen_calls: HashSet<String> = HashSet::new();
 
         for _ in 0..MAX_ITERATIONS {
-            let message = self
-                .chat
-                .chat(&self.model, history, &self.tools)
-                .await
-                .context("chat request failed")?;
+            let message = self.chat.chat(&self.model, history, &self.tools).await?;
             history.push(message.clone());
 
             let calls = collect_tool_calls(&message, &self.tool_names);
@@ -124,13 +190,14 @@ impl Agent {
         args: Map<String, Value>,
         seen_calls: &mut HashSet<String>,
     ) -> String {
-        if !self.tool_names.contains(name) {
-            return format!("ERROR: unknown tool '{name}'. Available tools: {}", {
-                let mut names: Vec<_> = self.tool_names.iter().cloned().collect();
-                names.sort();
+        let Some(entry) = self.route.get(name) else {
+            let mut names: Vec<_> = self.route.keys().cloned().collect();
+            names.sort();
+            return format!(
+                "ERROR: unknown tool '{name}'. Available tools: {}",
                 names.join(", ")
-            });
-        }
+            );
+        };
 
         let signature = format!("{name}:{}", Value::Object(args.clone()));
         if !seen_calls.insert(signature) {
@@ -140,16 +207,34 @@ impl Agent {
             );
         }
 
-        match self.mcp.call_tool(name, args).await {
-            Ok(text) => truncate(text),
+        let client = &self.clients[entry.client_idx];
+        // The payload actually sent to the server: the bare tool name and its
+        // JSON arguments. Enable with `RUST_LOG=mcp_chat=debug`.
+        let payload = Value::Object(args.clone());
+        tracing::debug!(
+            tool = %name,
+            real_name = %entry.real_name,
+            %payload,
+            "calling MCP tool"
+        );
+        match client.call_tool(&entry.real_name, args).await {
+            Ok(text) => {
+                tracing::debug!(tool = %name, result_chars = text.len(), "tool returned");
+                truncate(text)
+            }
             // Surface the error to the model rather than aborting the turn.
-            Err(e) => format!("ERROR calling '{name}': {e}"),
+            Err(e) => {
+                tracing::debug!(tool = %name, error = %e, "tool call failed");
+                format!("ERROR calling '{name}': {e}")
+            }
         }
     }
 
-    /// Release the MCP server connection.
+    /// Release all MCP server connections.
     pub async fn shutdown(self) {
-        self.mcp.shutdown().await;
+        for client in self.clients {
+            client.shutdown().await;
+        }
     }
 }
 
@@ -273,12 +358,13 @@ fn truncate(mut text: String) -> String {
     text
 }
 
-/// Convert an MCP tool definition into an OpenAI tool definition.
-fn to_tool_info(tool: &Tool) -> ToolInfo {
+/// Convert an MCP tool definition into an OpenAI tool definition, advertising it
+/// under `advertised_name` (bare or namespaced).
+fn to_tool_info(tool: &Tool, advertised_name: &str) -> ToolInfo {
     ToolInfo {
         tool_type: ToolType::Function,
         function: ToolFunctionInfo {
-            name: tool.name.to_string(),
+            name: advertised_name.to_string(),
             description: tool
                 .description
                 .as_ref()

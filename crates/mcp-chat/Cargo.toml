@@ -1,0 +1,38 @@
+[package]
+name = "mcp-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A config-driven chat + MCP REPL: drives an OpenAI-compatible model that calls
+# tools from one (later: several) MCP server, over stdio or HTTP. The binary is
+# corpus-agnostic — the domain enters only through the system prompt and the MCP
+# server it connects to.
+[[bin]]
+name = "mcp-chat"
+path = "src/bin/mcp-chat.rs"
+required-features = ["bin"]
+
+[features]
+default = ["bin"]
+# The command-line front-end (clap args + TOML config loader + log setup). Off
+# for consumers that embed the library and supply their own [`ChatOptions`].
+bin = ["dep:clap", "dep:toml", "dep:tracing-subscriber"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+http.workspace = true
+rustyline.workspace = true
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+clap = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }

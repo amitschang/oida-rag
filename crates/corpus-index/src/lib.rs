@@ -9,8 +9,6 @@
 
 pub mod apply;
 pub mod artifacts;
-#[cfg(feature = "chat")]
-pub mod chat;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config;
