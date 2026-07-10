@@ -43,19 +43,35 @@ struct Args {
     #[arg(long)]
     label: Option<String>,
 
-    /// Connect to a stdio MCP server by spawning this binary. Overrides any
-    /// servers in the config file. Mutually exclusive with `--mcp-http`.
-    #[arg(long, value_name = "BIN", conflicts_with = "mcp_http")]
+    /// Connect to a stdio MCP server by spawning this binary. At most one stdio
+    /// server is allowed; it may be combined with any number of `--mcp-http`
+    /// servers. Any `--mcp-*` flag overrides the config file's servers.
+    #[arg(long, value_name = "BIN")]
     mcp_stdio: Option<PathBuf>,
 
-    /// Connect to an HTTP MCP server at this URL. Overrides any servers in the
-    /// config file. Mutually exclusive with `--mcp-stdio`.
-    #[arg(long, value_name = "URL")]
-    mcp_http: Option<String>,
+    /// Namespace override for the `--mcp-stdio` server, used to disambiguate
+    /// tool names. Omit to keep its default namespace.
+    #[arg(long, value_name = "NS", requires = "mcp_stdio")]
+    mcp_stdio_ns: Option<String>,
 
-    /// `Authorization` header value for `--mcp-http` (e.g. `"Bearer …"`).
-    #[arg(long, requires = "mcp_http")]
-    mcp_auth: Option<String>,
+    /// Connect to an HTTP MCP server at this URL. Repeatable to connect to
+    /// several HTTP servers. Any `--mcp-*` flag overrides the config file's
+    /// servers.
+    #[arg(long, value_name = "URL")]
+    mcp_http: Vec<String>,
+
+    /// `Authorization` header value (e.g. `"Bearer …"`) for the correspondingly
+    /// positioned `--mcp-http` server. Repeatable; the Nth `--mcp-auth` pairs
+    /// with the Nth `--mcp-http`. Use an empty string to skip a position.
+    #[arg(long, value_name = "HEADER", requires = "mcp_http")]
+    mcp_auth: Vec<String>,
+
+    /// Namespace override for the correspondingly positioned `--mcp-http`
+    /// server, used to disambiguate tool names. Repeatable; the Nth `--mcp-ns`
+    /// pairs with the Nth `--mcp-http`. Use an empty string to keep a server's
+    /// default namespace. (For the stdio server, use `--mcp-stdio-ns`.)
+    #[arg(long, value_name = "NS", requires = "mcp_http")]
+    mcp_ns: Vec<String>,
 
     /// Run this single query non-interactively and exit.
     #[arg(long)]
@@ -109,26 +125,55 @@ fn resolve(args: Args, file: FileConfig) -> anyhow::Result<ChatOptions> {
     })
 }
 
-/// A `--mcp-*` flag defines a single server and overrides the file; otherwise the
-/// file's `[[server]]` entries are used.
+/// The `--mcp-*` flags define the servers and override the file: at most one
+/// `--mcp-stdio` plus any number of `--mcp-http` endpoints. When no such flag is
+/// given, the file's `[[server]]` entries are used.
+///
+/// `--mcp-auth` and `--mcp-ns` both pair positionally with `--mcp-http`; the
+/// stdio server takes its namespace from `--mcp-stdio-ns`.
 fn resolve_servers(args: &Args, file: &FileConfig) -> anyhow::Result<Vec<McpServer>> {
+    check_pairing("--mcp-auth", args.mcp_auth.len(), args.mcp_http.len())?;
+    check_pairing("--mcp-ns", args.mcp_ns.len(), args.mcp_http.len())?;
+
+    let mut servers = Vec::new();
     if let Some(bin) = &args.mcp_stdio {
-        return Ok(vec![McpServer::Stdio {
+        servers.push(McpServer::Stdio {
             bin: bin.clone(),
             args: Vec::new(),
             env: Vec::new(),
-        }]);
+            name: non_empty(args.mcp_stdio_ns.clone()),
+        });
     }
-    if let Some(url) = &args.mcp_http {
-        return Ok(vec![McpServer::Http {
+    for (i, url) in args.mcp_http.iter().enumerate() {
+        servers.push(McpServer::Http {
             url: url.clone(),
-            auth_header: args.mcp_auth.clone(),
+            auth_header: non_empty(args.mcp_auth.get(i).cloned()),
             headers: Vec::new(),
-        }]);
+            name: non_empty(args.mcp_ns.get(i).cloned()),
+        });
+    }
+    if !servers.is_empty() {
+        return Ok(servers);
     }
     // No server configured is allowed: the session runs as a plain chat with no
     // tools. `--mcp-stdio`/`--mcp-http`/`[[server]]` add tools when wanted.
     file.servers.iter().map(ServerEntry::to_mcp_server).collect()
+}
+
+/// Reject more positional `flag` values than there are `--mcp-http` servers to
+/// pair them with.
+fn check_pairing(flag: &str, given: usize, http_count: usize) -> anyhow::Result<()> {
+    if given > http_count {
+        anyhow::bail!(
+            "got {given} {flag} value(s) but only {http_count} --mcp-http server(s); each {flag} pairs with one --mcp-http"
+        );
+    }
+    Ok(())
+}
+
+/// Treat an absent value or an empty string alike as "not set".
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
 }
 
 /// Resolve the system prompt: a `--system-prompt` flag (with `@file` sugar) wins,

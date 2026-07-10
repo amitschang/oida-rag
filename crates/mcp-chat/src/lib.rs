@@ -60,7 +60,7 @@ pub async fn run(opts: ChatOptions) -> anyhow::Result<()> {
         let tools = client.list_tools().await?;
         repl::print_tools(&tools, &opts.label);
         server_tools.push(ServerTools {
-            namespace: server.default_namespace(),
+            namespace: server.namespace(),
             client,
             tools,
         });

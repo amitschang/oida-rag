@@ -80,11 +80,13 @@ impl ServerEntry {
                 bin: command.into(),
                 args: self.args.clone(),
                 env: self.env.clone().into_iter().collect(),
+                name: self.name.clone(),
             }),
             (None, Some(url)) => Ok(McpServer::Http {
                 url: url.clone(),
                 auth_header: self.auth_header.clone(),
                 headers: self.headers.clone().into_iter().collect(),
+                name: self.name.clone(),
             }),
             (Some(_), Some(_)) => {
                 anyhow::bail!("server entry sets both `command` and `url`; use exactly one")

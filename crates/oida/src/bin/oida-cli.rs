@@ -432,6 +432,7 @@ async fn run_chat(config: &OidaConfig, args: &ChatArgs) -> anyhow::Result<()> {
             bin: resolve_server_bin(args.server_bin.clone())?,
             args: Vec::new(),
             env: Vec::new(),
+            name: None,
         }],
         chat_host: config.chat.chat_host.clone(),
         chat_api_key: config.chat.chat_api_key.clone(),

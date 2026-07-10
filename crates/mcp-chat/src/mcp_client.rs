@@ -24,6 +24,9 @@ pub enum McpServer {
         args: Vec<String>,
         /// Extra environment variables layered onto the inherited environment.
         env: Vec<(String, String)>,
+        /// Namespace override for this server's tools; falls back to a slug
+        /// derived from the endpoint when `None`.
+        name: Option<String>,
     },
     /// Connect to a streamable-HTTP MCP endpoint.
     Http {
@@ -33,6 +36,9 @@ pub enum McpServer {
         auth_header: Option<String>,
         /// Extra request headers, as `(name, value)` pairs.
         headers: Vec<(String, String)>,
+        /// Namespace override for this server's tools; falls back to a slug
+        /// derived from the endpoint when `None`.
+        name: Option<String>,
     },
 }
 
@@ -42,6 +48,19 @@ impl McpServer {
         match self {
             McpServer::Stdio { bin, .. } => format!("child process {}", bin.display()),
             McpServer::Http { url, .. } => format!("HTTP endpoint {url}"),
+        }
+    }
+
+    /// The namespace used to disambiguate this server's tools when more than one
+    /// server is connected (§ tool namespacing): the explicit `name` override if
+    /// set, otherwise [`default_namespace`](Self::default_namespace).
+    pub fn namespace(&self) -> String {
+        let name = match self {
+            McpServer::Stdio { name, .. } | McpServer::Http { name, .. } => name.as_deref(),
+        };
+        match name {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => self.default_namespace(),
         }
     }
 
@@ -73,7 +92,7 @@ impl McpClient {
     /// handshake.
     pub async fn connect(server: &McpServer) -> anyhow::Result<Self> {
         let service = match server {
-            McpServer::Stdio { bin, args, env } => {
+            McpServer::Stdio { bin, args, env, .. } => {
                 let mut cmd = tokio::process::Command::new(bin);
                 cmd.args(args);
                 for (key, value) in env {
@@ -91,6 +110,7 @@ impl McpClient {
                 url,
                 auth_header,
                 headers,
+                ..
             } => {
                 let config = build_http_config(url, auth_header.as_deref(), headers)?;
                 // Let rmcp build its own HTTP client (its reqwest version differs
