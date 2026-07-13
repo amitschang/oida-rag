@@ -36,7 +36,7 @@ use lance_index::scalar::FullTextSearchQuery;
 use lancedb::arrow::SendableRecordBatchStream;
 use lancedb::index::Index as LanceIndex;
 use lancedb::index::scalar::FtsIndexBuilder;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::query::{ExecutableQuery, HasQuery, QueryBase, Select};
 use lancedb::rerankers::rrf::RRFReranker;
 use lancedb::table::{CompactionOptions, OptimizeAction};
 use lancedb::{Connection, Table};
@@ -200,11 +200,16 @@ impl HybridIndex {
         // Over-fetch chunks so that, after collapsing to one hit per document,
         // we still have enough distinct documents to satisfy `limit`.
         let candidates = limit.saturating_mul(5).max(limit);
-        let batches: Vec<RecordBatch> = self
+        let mut query = self
             .table
             .query()
             .nearest_to(qvec)
-            .context("building vector query")?
+            .context("building vector query")?;
+        // Adopt the future Lance behavior: don't auto-project `_score` into the
+        // output. We rely on `_relevance_score` from the reranker instead.
+        // TODO: remove once Lance makes this the default (currently lancedb 0.30).
+        query.mut_query().disable_scoring_autoprojection = true;
+        let batches: Vec<RecordBatch> = query
             .full_text_search(FullTextSearchQuery::new(text.to_string()))
             .rerank(Arc::new(RRFReranker::default()))
             .select(Select::columns(&["doc_id", "artifact_name", "text"]))

@@ -17,7 +17,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::arrow::SendableRecordBatchStream;
-use lancedb::query::{ColumnOrdering, ExecutableQuery, QueryBase, QueryExecutionOptions, Select};
+use lancedb::query::{
+    ColumnOrdering, ExecutableQuery, HasQuery, QueryBase, QueryExecutionOptions, Select,
+};
 use lancedb::{Connection, Table};
 
 use crate::config::CoreConfig;
@@ -571,9 +573,12 @@ impl Index {
         query: &str,
         limit: usize,
     ) -> Result<Vec<D>> {
-        let batches: Vec<RecordBatch> = self
-            .documents
-            .query()
+        let mut base = self.documents.query();
+        // Adopt the future Lance behavior: don't auto-project `_score` into the
+        // output, which we don't read here anyway.
+        // TODO: remove once Lance makes this the default (currently lancedb 0.30).
+        base.mut_query().disable_scoring_autoprojection = true;
+        let batches: Vec<RecordBatch> = base
             .full_text_search(FullTextSearchQuery::new(query.to_string()))
             .select(Select::columns(D::columns()))
             .limit(limit)
