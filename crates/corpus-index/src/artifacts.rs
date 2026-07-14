@@ -8,7 +8,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::source::ArtifactReader;
+use crate::source::{ArtifactReader, ArtifactTier};
 
 /// Outcome of an artifact-text request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -41,6 +41,10 @@ pub struct ArtifactText {
     pub total_bytes: Option<u64>,
     /// Whether more text remains beyond what was returned.
     pub truncated: bool,
+    /// Which tier served the bytes (`raw` LanceDB blob table vs the original
+    /// `artifact_store`), present only when `status == TextLoaded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ArtifactTier>,
 }
 
 impl ArtifactText {
@@ -54,6 +58,7 @@ impl ArtifactText {
             returned_bytes: 0,
             total_bytes: None,
             truncated: false,
+            source: None,
         }
     }
 }
@@ -93,7 +98,7 @@ pub async fn read_artifact_text(
         );
     }
 
-    let bytes = match reader.bytes(id, name, media_type).await {
+    let (bytes, tier) = match reader.bytes(id, name, media_type).await {
         Ok(Some(b)) => b,
         Ok(None) => {
             return ArtifactText::status_only(
@@ -127,6 +132,7 @@ pub async fn read_artifact_text(
         total_bytes: Some(total),
         truncated: (end as u64) < total,
         text: Some(text),
+        source: Some(tier),
     }
 }
 

@@ -38,9 +38,15 @@ object_store = { version = "0.13", features = ["aws"] }
 futures = "0.3"
 indicatif = "0.18"
 rmcp = "1"
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
 http = "1"
 clap = { version = "4", features = ["derive", "env"] }
 rustyline = "17"
 toml = "0.9"
 schemars = "1"
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true

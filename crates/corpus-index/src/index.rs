@@ -54,6 +54,12 @@ const TEXT_FILTER: &str = "media_type = 'text/plain'";
 /// no-`media_type`/no-`name` rows that are not real artifacts — exactly the
 /// complement of [`TEXT_FILTER`] over the real artifacts.
 const NONTEXT_FILTER: &str = "media_type <> 'text/plain'";
+/// Predicate selecting *every* real artifact raw storage keeps when text is
+/// stored alongside the binaries (`store_text_in_raw`). A real artifact is one
+/// with a `media_type`; the same `IS NOT NULL` guard [`NONTEXT_FILTER`] relies
+/// on excludes the no-`media_type` rows that are not real artifacts. This is
+/// `NONTEXT_FILTER ∪ TEXT_FILTER` collapsed to a single indexable predicate.
+const REAL_ARTIFACT_FILTER: &str = "media_type IS NOT NULL";
 
 /// Output batch size for the streamed artifact scans ([`Index::text_artifacts_stream`]
 /// and [`Index::nontext_artifacts_stream`]). LanceDB caps batches at 1024 rows
@@ -290,6 +296,12 @@ impl Index {
     /// text artifact is "real" once it has been chunked into the `chunks`
     /// table, a non-text artifact once it lives in `raw_artifacts`. Both
     /// reuse the same metadata `size`, so the two are directly comparable.
+    ///
+    /// The split is by *content type*, not by physical table. When
+    /// `store_text_in_raw` is on, `raw_artifacts` also holds the text/plain
+    /// artifacts; those still count toward the text set (their real bytes are
+    /// attributed via `chunks`), so the raw-real scan below excludes them to
+    /// keep the two sets disjoint and avoid double-counting.
     pub async fn store_sizes(&self) -> Result<StoreSizes> {
         use std::collections::HashSet;
 
@@ -367,7 +379,10 @@ impl Index {
             }
         }
 
-        // Real non-text bytes: sum the `size` column of stored raw artifacts.
+        // Real non-text bytes: sum the `size` column of stored raw artifacts,
+        // restricted to the non-text rows so text artifacts co-stored in
+        // `raw_artifacts` (when `store_text_in_raw` is on) are not counted here —
+        // they belong to the text set, attributed via `chunks` above.
         if contains_table(&names, RAW_ARTIFACTS_TABLE) {
             let raws = self
                 .db
@@ -377,6 +392,7 @@ impl Index {
                 .context("opening raw_artifacts table")?;
             let batches: Vec<RecordBatch> = raws
                 .query()
+                .only_if(NONTEXT_FILTER)
                 .select(Select::columns(&["size"]))
                 .execute()
                 .await
@@ -678,34 +694,42 @@ impl Index {
             .context("counting text artifacts")? as u64)
     }
 
-    /// Stream every artifact whose contents are *not* plain text (the
-    /// complement of [`Index::text_artifacts_stream`]) as record batches of
+    /// Stream the artifacts raw storage keeps as record batches of
     /// `(id, name, media_type, md5, size)`, the columns [`raw_refs_from_batch`]
-    /// decodes into [`RawArtifactRef`]s.
+    /// decodes into [`RawArtifactRef`]s. With `include_text` the scan covers
+    /// every real artifact ([`REAL_ARTIFACT_FILTER`]); without it, only the
+    /// non-text files (the complement of [`Index::text_artifacts_stream`],
+    /// [`NONTEXT_FILTER`]).
     ///
     /// Returned as a stream, not a materialized `Vec`, so raw storage can pull
     /// candidates batch-by-batch: over >24M artifacts the full list would be
     /// gigabytes resident. Raw storage checkpoints each `(id, name)`
     /// independently, so — unlike the full-text build — it needs no document
     /// grouping and the scan can stream unordered.
-    pub(crate) async fn nontext_artifacts_stream(&self) -> Result<SendableRecordBatchStream> {
+    pub(crate) async fn raw_artifacts_stream(
+        &self,
+        include_text: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let filter = if include_text { REAL_ARTIFACT_FILTER } else { NONTEXT_FILTER };
         self.artifacts
             .query()
-            .only_if(NONTEXT_FILTER)
+            .only_if(filter)
             .select(Select::columns(&["id", "name", "media_type", "md5", "size"]))
             .execute_with_options(scan_options())
             .await
-            .context("executing non-text-artifacts query")
+            .context("executing raw-artifacts query")
     }
 
-    /// Count the non-text artifacts ([`NONTEXT_FILTER`]) without materializing
-    /// them — the progress denominator for a streamed raw-storage pass.
-    pub(crate) async fn nontext_count(&self) -> Result<u64> {
+    /// Count the artifacts a raw-storage pass will consider without
+    /// materializing them — the progress denominator. Mirrors the
+    /// `include_text` filter choice of [`Index::raw_artifacts_stream`].
+    pub(crate) async fn raw_count(&self, include_text: bool) -> Result<u64> {
+        let filter = if include_text { REAL_ARTIFACT_FILTER } else { NONTEXT_FILTER };
         Ok(self
             .artifacts
-            .count_rows(Some(NONTEXT_FILTER.to_string()))
+            .count_rows(Some(filter.to_string()))
             .await
-            .context("counting non-text artifacts")? as u64)
+            .context("counting raw-storage artifacts")? as u64)
     }
 
     /// Delete every raw-artifact row whose `id` (document id) is in `doc_ids`

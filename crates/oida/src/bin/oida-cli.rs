@@ -145,6 +145,12 @@ struct IngestArgs {
     #[arg(long)]
     store_raw: bool,
 
+    /// With `--store-raw`, keep the raw store binary-only: do NOT also store
+    /// text/plain artifacts. By default text is stored alongside the binaries so
+    /// `get_artifact_text` serves OCR text byte-exact from LanceDB.
+    #[arg(long)]
+    no_text_in_raw: bool,
+
     /// Inclusive lower-bound modified-date (ISO-8601, e.g.
     /// 2026-01-01T00:00:00Z). With `--force` omit for a full scan; otherwise
     /// omit to use the stored watermark.
@@ -401,6 +407,9 @@ async fn main() -> anyhow::Result<()> {
             a.tuning.overlay(&mut config.core);
             if a.store_raw {
                 config.core.store_raw_artifacts = true;
+            }
+            if a.no_text_in_raw {
+                config.core.store_text_in_raw = false;
             }
             run_ingest(&config, &a).await
         }

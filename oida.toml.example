@@ -52,6 +52,12 @@ ingest_buffer_bytes = 536870912
 # artifact source below; the text/plain OCR chunk index is built regardless.
 # store_raw_artifacts = false
 
+# When raw storage is on, also keep text/plain artifacts in `raw_artifacts` so
+# it holds every artifact's bytes and `get_artifact_text` serves OCR text
+# byte-exact from LanceDB (falling back to the artifact source on a miss). On by
+# default; set false (or pass `--no-text-in-raw`) for a binary-only raw store.
+# store_text_in_raw = true
+
 # Target size, in bytes, of each `raw_artifacts` LanceDB fragment. Fetched blobs
 # (whose individual sizes vary widely) accumulate until their combined size
 # reaches this target, then flush as one fragment, keeping file sizes even.

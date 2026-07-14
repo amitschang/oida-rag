@@ -129,8 +129,12 @@ pub(crate) async fn build_with_progress(
 
     // Progress denominator: all non-text candidates minus those already stored,
     // counted rather than materialized so the candidate list never lands in RAM.
+    // When configured, text/plain artifacts are stored alongside the binaries so
+    // `raw_artifacts` is the byte-faithful tier for every artifact; otherwise the
+    // pass keeps its historical non-text-only scope.
+    let include_text = config.store_text_in_raw;
     if let Some(p) = progress {
-        let total = index.nontext_count().await?;
+        let total = index.raw_count(include_text).await?;
         p.total
             .store(total.saturating_sub(already.len() as u64), Ordering::Relaxed);
     }
@@ -160,7 +164,7 @@ pub(crate) async fn build_with_progress(
     let (write_tx, write_rx) = mpsc::channel::<RecordBatch>(WRITE_CHANNEL_CAP);
 
     let (skipped, (stored, missing), table) = tokio::try_join!(
-        produce_refs(index, &already, progress, refs_tx),
+        produce_refs(index, include_text, &already, progress, refs_tx),
         fetch_stage(
             &source,
             config.read_concurrency,
@@ -187,13 +191,15 @@ pub(crate) async fn build_with_progress(
     })
 }
 
-/// Stage 1: stream the non-text candidates from the index, skip the keys already
+/// Stage 1: stream the raw-storage candidates from the index (non-text only, or
+/// every real artifact when `include_text`), skip the keys already
 /// stored (resume), and emit them in `FETCH_CHUNK`-sized groups onto `tx`.
 ///
 /// Streamed batch-by-batch instead of materializing the whole list: over >24M
 /// artifacts it would be gigabytes. Returns the number of candidates skipped.
 async fn produce_refs(
     index: &Index,
+    include_text: bool,
     already: &HashSet<u128>,
     progress: Option<&RawProgress>,
     tx: mpsc::Sender<Vec<RawArtifactRef>>,
@@ -202,13 +208,13 @@ async fn produce_refs(
     let mut fetch_buf: Vec<RawArtifactRef> = Vec::with_capacity(FETCH_CHUNK);
 
     let mut stream = index
-        .nontext_artifacts_stream()
+        .raw_artifacts_stream(include_text)
         .await
-        .context("streaming non-text artifacts")?;
+        .context("streaming raw-storage artifacts")?;
     while let Some(batch) = stream
         .try_next()
         .await
-        .context("reading non-text artifact batch")?
+        .context("reading raw-storage artifact batch")?
     {
         for r in raw_refs_from_batch(&batch)? {
             if already.contains(&key128(&r.id, &r.name)) {

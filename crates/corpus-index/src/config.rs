@@ -72,6 +72,15 @@ pub const DEFAULT_EMBED_LOOKAHEAD_FACTOR: usize = 8;
 /// content digest across servers), so set the name to encode a weights identity
 /// — a commit hash, a quantization tag, a `num_ctx` variant — and keep this on.
 pub const DEFAULT_EMBED_VERIFY_MODEL: bool = true;
+/// Whether, by default, raw storage also keeps text/plain artifacts (in addition
+/// to the non-text files). On by default so `raw_artifacts` is the byte-faithful
+/// tier for *every* artifact: `get_artifact_text` then serves OCR text straight
+/// from LanceDB (byte-exact, no chunk reconstruction) rather than the artifact
+/// source, and falls back to the source only on a miss. The text bytes are small
+/// and compressible relative to the binary artifacts; turn this off to keep a
+/// binary-only raw store and serve text from the artifact source instead. Only
+/// takes effect when `store_raw_artifacts` is on.
+pub const DEFAULT_STORE_TEXT_IN_RAW: bool = true;
 
 /// Corpus-agnostic engine configuration: everything the framework drivers
 /// (index open, hybrid build, artifact source, raw store) need, with no
@@ -145,6 +154,11 @@ pub struct CoreConfig {
     /// `raw_artifacts` table, fetched from the artifact source. Off by default;
     /// the text/plain chunk index is built regardless.
     pub store_raw_artifacts: bool,
+    /// Whether raw storage also keeps text/plain artifacts, so `raw_artifacts`
+    /// holds *every* artifact's bytes and `get_artifact_text` can serve OCR text
+    /// byte-exact from LanceDB (falling back to the artifact source on a miss).
+    /// On by default; only meaningful when `store_raw_artifacts` is on.
+    pub store_text_in_raw: bool,
     /// Target size, in bytes, of each `raw_artifacts` LanceDB fragment. Fetched
     /// blobs accumulate until their combined size reaches this target, then
     /// flush as one fragment, so file sizes stay consistent despite widely
@@ -185,6 +199,7 @@ impl Default for CoreConfig {
             embed_lookahead: 0,
             embed_verify_model: DEFAULT_EMBED_VERIFY_MODEL,
             store_raw_artifacts: false,
+            store_text_in_raw: DEFAULT_STORE_TEXT_IN_RAW,
             raw_file_bytes: DEFAULT_RAW_FILE_BYTES,
             s3_bucket: None,
             s3_region: None,

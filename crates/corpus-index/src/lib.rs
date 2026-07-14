@@ -40,6 +40,6 @@ pub use provider::{DocumentsContract, SourcePage, SourceProvider};
 pub use row::{DocumentRow, SearchableRow};
 pub use search::SearchParams;
 pub use source::{
-    ArtifactReader, ArtifactSource, ArtifactStore, ObjectArtifactStore, build_object_store,
-    fanout_key,
+    ArtifactReader, ArtifactSource, ArtifactStore, ArtifactTier, ObjectArtifactStore,
+    build_object_store, fanout_key,
 };

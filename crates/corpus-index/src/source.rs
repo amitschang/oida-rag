@@ -34,8 +34,22 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use crate::config::CoreConfig;
 use crate::index::sql_str;
+
+/// Which tier of an [`ArtifactReader`] served a set of bytes, surfaced so the
+/// artifact-read tools can report provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactTier {
+    /// The materialized `raw_artifacts` LanceDB blob table.
+    Raw,
+    /// The original artifact source (local directory or S3 bucket).
+    ArtifactStore,
+}
 
 /// The framework's pluggable artifact-retrieval interface.
 ///
@@ -226,23 +240,28 @@ impl ArtifactReader {
         self.raw.is_some() || self.fallback.is_some()
     }
 
-    /// Resolve an artifact's bytes through the tiers, or `None` if absent.
+    /// Resolve an artifact's bytes through the tiers, tagged with the tier that
+    /// served them, or `None` if absent.
     ///
     /// `media_type` is an advisory hint; correctness does not depend on it (a
-    /// text artifact simply misses the `raw_artifacts` tier and falls through).
+    /// text artifact simply misses the `raw_artifacts` tier and falls through
+    /// when raw storage was built binary-only).
     pub async fn bytes(
         &self,
         id: &str,
         name: &str,
         _media_type: Option<&str>,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, ArtifactTier)>> {
         if let Some(raw) = &self.raw
             && let Some(blob) = raw_blob(raw, id, name).await?
         {
-            return Ok(Some(blob));
+            return Ok(Some((blob, ArtifactTier::Raw)));
         }
         if let Some(fallback) = &self.fallback {
-            return fallback.get(id, name).await;
+            return Ok(fallback
+                .get(id, name)
+                .await?
+                .map(|b| (b, ArtifactTier::ArtifactStore)));
         }
         Ok(None)
     }
@@ -312,6 +331,80 @@ mod tests {
             source.key_display("mskf0352", "mskf0352.ocr"),
             "artifacts/m/s/k/f/mskf0352/mskf0352.ocr"
         );
+    }
+
+    /// A text artifact materialized in `raw_artifacts` is served byte-exact by
+    /// `get_artifact_text`, tagged as coming from the raw tier — the behavior
+    /// `store_text_in_raw` enables (no chunk reconstruction, no source round-trip).
+    #[tokio::test]
+    async fn text_served_from_raw_table_tagged_raw() {
+        use arrow::array::{LargeBinaryArray, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        use crate::artifacts::{ArtifactTextStatus, read_artifact_text};
+        use crate::index::RAW_ARTIFACTS_TABLE;
+
+        let dir = std::env::temp_dir().join(format!("oida-rawtext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = lancedb::connect(dir.to_str().unwrap()).execute().await.unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("data", DataType::LargeBinary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["doc1"])),
+                Arc::new(StringArray::from(vec!["doc1.ocr"])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"hello world".as_ref())])),
+            ],
+        )
+        .unwrap();
+        let table = db.create_table(RAW_ARTIFACTS_TABLE, vec![batch]).execute().await.unwrap();
+
+        // Raw-only reader (no fallback): bytes come from LanceDB, tagged Raw.
+        let reader = ArtifactReader::new(Some(table), None);
+        let (bytes, tier) = reader
+            .bytes("doc1", "doc1.ocr", Some("text/plain"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"hello world");
+        assert_eq!(tier, ArtifactTier::Raw);
+
+        // get_artifact_text serves that text byte-exact and reports the raw tier.
+        let r =
+            read_artifact_text(Some(&reader), "doc1", "doc1.ocr", Some("text/plain"), 0, 100).await;
+        assert_eq!(r.status, ArtifactTextStatus::TextLoaded);
+        assert_eq!(r.text.as_deref(), Some("hello world"));
+        assert_eq!(r.source, Some(ArtifactTier::Raw));
+
+        // A miss in the raw tier with no fallback is a graceful absence.
+        assert!(reader.bytes("nope", "nope.ocr", None).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no raw tier, bytes resolve through the fallback store and are tagged
+    /// `ArtifactStore`.
+    #[tokio::test]
+    async fn fallback_bytes_tagged_artifact_store() {
+        let dir = std::env::temp_dir().join(format!("oida-fb-{}", std::process::id()));
+        let path = dir.join("m").join("s").join("k").join("f").join("mskf0352").join("mskf0352.ocr");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"body").unwrap();
+
+        let source = ArtifactSource::from_config(&cfg(dir.clone())).unwrap().unwrap();
+        let reader = ArtifactReader::new(None, Some(Arc::new(source) as Arc<dyn ArtifactStore>));
+        let (bytes, tier) = reader
+            .bytes("mskf0352", "mskf0352.ocr", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"body");
+        assert_eq!(tier, ArtifactTier::ArtifactStore);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

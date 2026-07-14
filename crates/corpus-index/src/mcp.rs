@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
@@ -29,7 +31,7 @@ use crate::index::Index;
 use crate::model::{HybridHit, SearchHit, TableSchema};
 use crate::row::{DocumentRow, SearchableRow};
 use crate::search::SearchParams;
-use crate::source::ArtifactReader;
+use crate::source::{ArtifactReader, ArtifactTier};
 
 /// Default and maximum number of search hits returned in one call.
 const DEFAULT_SEARCH_LIMIT: u32 = 10;
@@ -37,6 +39,12 @@ const MAX_SEARCH_LIMIT: u32 = 50;
 /// Default and maximum bytes of artifact text returned in one call.
 const DEFAULT_TEXT_BYTES: u64 = 8 * 1024;
 const MAX_TEXT_BYTES: u64 = 64 * 1024;
+/// Default and maximum *raw* bytes returned in one `get_artifact_bytes` call.
+/// Lower ceiling than a bulk download: the bytes are base64-encoded into the
+/// model's context (≈1.37× inflation), so large blobs are paged via
+/// `offset`/`max_bytes` rather than returned whole.
+const DEFAULT_ARTIFACT_BYTES: u64 = 64 * 1024;
+const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024;
 /// Default and maximum rows returned by a `run_sql` query.
 const DEFAULT_SQL_ROWS: u32 = 200;
 const MAX_SQL_ROWS: u32 = 2000;
@@ -136,6 +144,74 @@ pub struct GetArtifactTextRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetArtifactBytesRequest {
+    /// Id of the document that owns the artifact.
+    pub id: String,
+    /// Artifact file name (e.g. `mskf0352.pdf`).
+    pub name: String,
+    /// MIME type of the artifact, if known.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// Byte offset to start reading from (default 0).
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Max bytes to return (default 65536, max 1048576).
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+/// Outcome of a `get_artifact_bytes` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactBytesStatus {
+    /// No artifact source is configured (no `raw_artifacts` table and no
+    /// `artifact_root`/`s3_bucket`), so bytes cannot be located.
+    ArtifactSourceNotConfigured,
+    /// The artifact was not found in any tier.
+    ArtifactFileMissing,
+    /// Bytes were loaded successfully.
+    BytesLoaded,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GetArtifactBytesResponse {
+    pub name: String,
+    pub media_type: Option<String>,
+    pub status: ArtifactBytesStatus,
+    /// Base64-encoded bytes, present only when `status == BytesLoaded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// Byte offset the returned slice started at.
+    pub offset: u64,
+    /// Number of bytes returned (decoded, not base64 length).
+    pub returned_bytes: u64,
+    /// Total size of the artifact in bytes, when known.
+    pub total_bytes: Option<u64>,
+    /// Whether more bytes remain beyond what was returned.
+    pub truncated: bool,
+    /// Which tier served the bytes (`raw` vs `artifact_store`), present only
+    /// when `status == BytesLoaded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ArtifactTier>,
+}
+
+impl GetArtifactBytesResponse {
+    fn status_only(name: String, media_type: Option<String>, status: ArtifactBytesStatus) -> Self {
+        Self {
+            name,
+            media_type,
+            status,
+            data_base64: None,
+            offset: 0,
+            returned_bytes: 0,
+            total_bytes: None,
+            truncated: false,
+            source: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunSqlRequest {
     /// A single read-only SQL statement (SELECT/WITH/DESCRIBE/EXPLAIN/SHOW).
     /// Writes, DDL and multiple statements are rejected.
@@ -173,6 +249,13 @@ const GET_ARTIFACT_TEXT_DESC: &str =
      file name. Returns a status: text_loaded, artifact_file_missing, unsupported_artifact_type, \
      or artifact_root_not_configured. Supports paging via offset/max_bytes.";
 
+const GET_ARTIFACT_BYTES_DESC: &str =
+    "Read the raw bytes of any artifact (PDF, image, or other binary) by document id and file \
+     name, returned base64-encoded. Resolves from the materialized raw_artifacts store first, \
+     falling back to the artifact source. Returns a status: bytes_loaded, artifact_file_missing, \
+     or artifact_source_not_configured, plus which tier served it. Bytes are paged via \
+     offset/max_bytes (default 65536, max 1048576); prefer get_artifact_text for readable text.";
+
 const RUN_SQL_DESC: &str =
     "Run a single read-only SQL query (DataFusion SQL dialect) against the index for ad-hoc \
      counting, grouping, and filtering. The index has a `documents` table (one row per document) \
@@ -209,6 +292,59 @@ pub fn generic_router<S: CorpusBackend>() -> ToolRouter<S> {
                     max_bytes,
                 )
                 .await)
+            },
+        ))
+        .with_route(make_route(
+            "get_artifact_bytes",
+            GET_ARTIFACT_BYTES_DESC,
+            |server: S, req: GetArtifactBytesRequest| async move {
+                let reader = server.artifacts();
+                if !reader.is_configured() {
+                    return Ok(GetArtifactBytesResponse::status_only(
+                        req.name,
+                        req.media_type,
+                        ArtifactBytesStatus::ArtifactSourceNotConfigured,
+                    ));
+                }
+                let max_bytes = req
+                    .max_bytes
+                    .unwrap_or(DEFAULT_ARTIFACT_BYTES)
+                    .clamp(1, MAX_ARTIFACT_BYTES);
+                let (bytes, tier) = match reader
+                    .bytes(&req.id, &req.name, req.media_type.as_deref())
+                    .await
+                {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        return Ok(GetArtifactBytesResponse::status_only(
+                            req.name,
+                            req.media_type,
+                            ArtifactBytesStatus::ArtifactFileMissing,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!("reading artifact bytes {}/{}: {e}", req.id, req.name);
+                        return Ok(GetArtifactBytesResponse::status_only(
+                            req.name,
+                            req.media_type,
+                            ArtifactBytesStatus::ArtifactFileMissing,
+                        ));
+                    }
+                };
+                let total = bytes.len() as u64;
+                let start = req.offset.unwrap_or(0).min(total) as usize;
+                let end = (start as u64 + max_bytes).min(total) as usize;
+                Ok(GetArtifactBytesResponse {
+                    name: req.name,
+                    media_type: req.media_type,
+                    status: ArtifactBytesStatus::BytesLoaded,
+                    data_base64: Some(BASE64.encode(&bytes[start..end])),
+                    offset: start as u64,
+                    returned_bytes: (end - start) as u64,
+                    total_bytes: Some(total),
+                    truncated: (end as u64) < total,
+                    source: Some(tier),
+                })
             },
         ))
         .with_route(make_route(

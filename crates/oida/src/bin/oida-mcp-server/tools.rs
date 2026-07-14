@@ -196,12 +196,13 @@ mod tests {
     #[test]
     fn advertises_the_full_tool_set() {
         // The framework generic tools + OIDA domain tools must merge to exactly
-        // the seven advertised tools.
+        // the eight advertised tools.
         let all = OidaServer::router().list_all();
         let names: Vec<&str> = all.iter().map(|t| t.name.as_ref()).collect();
         for expected in [
             "search_documents",
             "get_artifact_text",
+            "get_artifact_bytes",
             "run_sql",
             "describe_schema",
             "hybrid_search",
@@ -210,7 +211,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
-        assert_eq!(all.len(), 7, "expected 7 tools, got {}", all.len());
+        assert_eq!(all.len(), 8, "expected 8 tools, got {}", all.len());
 
         // The OIDA-only tools live in the domain router.
         let domain = OidaServer::domain_router();
