@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -432,6 +432,12 @@ pub(crate) async fn build_with_progress(
     })?;
     let dim = dim.expect("dim is set whenever a batch was written");
 
+    // The embed pipeline has drained; everything below (the `_meta` write, the
+    // optional compaction, and the FTS/vector index builds) reports no
+    // incremental progress. Signal the ticker so it retires the full-text bar
+    // and prints a phase message instead of redrawing frozen counters.
+    progress.post_embed.store(true, Ordering::Relaxed);
+
     // Write `_meta` now, before the (optional, slow) compaction and index builds.
     // Every value it records is already final and durable: the chunks are on
     // disk, `dim`/`chunk_count`/`doc_count` are known, and compaction/indexing
@@ -461,6 +467,7 @@ pub(crate) async fn build_with_progress(
     // but this keeps the result insensitive to how the row counts fell.
     if config.compact_on_build {
         tracing::info!("compacting chunks table before indexing");
+        let started = Instant::now();
         let stats = table
             .optimize(OptimizeAction::Compact {
                 options: CompactionOptions::default(),
@@ -468,30 +475,38 @@ pub(crate) async fn build_with_progress(
             })
             .await
             .context("compacting chunks table")?;
-        if let Some(m) = stats.compaction {
-            tracing::info!(
-                "compaction: {} fragments removed, {} fragments added",
-                m.fragments_removed,
-                m.fragments_added
-            );
-        }
+        let (removed, added) = stats
+            .compaction
+            .map_or((0, 0), |m| (m.fragments_removed, m.fragments_added));
+        tracing::info!(
+            "compaction done in {:.1}s ({removed} fragments removed, {added} fragments added)",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     tracing::info!("creating full-text index on {chunk_count} chunks");
+    let started = Instant::now();
     table
         .create_index(&["text"], LanceIndex::FTS(FtsIndexBuilder::default()))
         .execute()
         .await
         .context("creating FTS index")?;
+    tracing::info!(
+        "full-text index done in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
 
     if (chunk_count as usize) >= MIN_VECTOR_INDEX_ROWS {
         tracing::info!("creating vector index");
-        if let Err(e) = table
-            .create_index(&["vector"], LanceIndex::Auto)
-            .execute()
-            .await
-        {
-            tracing::warn!("vector index creation failed ({e}); queries will use flat search");
+        let started = Instant::now();
+        match table.create_index(&["vector"], LanceIndex::Auto).execute().await {
+            Ok(()) => tracing::info!(
+                "vector index done in {:.1}s",
+                started.elapsed().as_secs_f64()
+            ),
+            Err(e) => {
+                tracing::warn!("vector index creation failed ({e}); queries will use flat search")
+            }
         }
     } else {
         tracing::info!("skipping vector index ({chunk_count} chunks < {MIN_VECTOR_INDEX_ROWS})");

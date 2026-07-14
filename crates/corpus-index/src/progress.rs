@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -62,6 +62,12 @@ pub(crate) struct FullTextProgress {
     /// Embedded batches waiting in the channel for the writer. Near the channel
     /// cap ⇒ LanceDB write backpressure is the bottleneck.
     pub(crate) out_queued: AtomicU64,
+    /// Set once the embed pipeline has drained and the pass has moved on to the
+    /// post-embed compaction + index builds. Those phases advance none of the
+    /// counters above and LanceDB reports no incremental progress for them, so
+    /// the ticker retires the full-text bar and emits a one-shot message rather
+    /// than continuing to redraw a now-frozen bar.
+    pub(crate) post_embed: AtomicBool,
 }
 
 struct FullTextProgressSnapshot {
@@ -184,6 +190,10 @@ pub(crate) async fn run_ticker(
     // Recent (timestamp, chunks, text bytes, raw bytes) samples within the
     // window, for the sliding-window rates.
     let mut samples: VecDeque<(Instant, u64, u64, u64)> = VecDeque::new();
+    // Set once we observe the full-text pass leave the embed stage: from then on
+    // its bar is retired and its counters are no longer rendered, since the
+    // remaining compaction + index builds report no incremental progress.
+    let mut text_done = false;
 
     loop {
         let stopping = tokio::select! {
@@ -229,6 +239,27 @@ pub(crate) async fn run_ticker(
         // ~4 bytes per token is a rough English heuristic; labelled an estimate.
         let recent_tps = recent_bps / 4.0;
 
+        // First tick after the embed pipeline drains: retire the full-text bar
+        // and announce the untracked post-embed phase. Done once; afterwards the
+        // bar is left alone and its (now frozen) counters are not re-rendered, so
+        // the compaction/index `tracing` lines print against a settled display.
+        if !text_done
+            && text
+                .as_ref()
+                .is_some_and(|p| p.post_embed.load(Ordering::Relaxed))
+        {
+            text_done = true;
+            if let Some(text_bar) = bars.as_ref().and_then(|b| b.text.as_ref()) {
+                text_bar.finish_with_message(
+                    "embedding complete — compacting and building indexes",
+                );
+            }
+            tracing::info!(
+                "full-text embedding complete; compacting and building indexes \
+                 (no incremental progress for these phases)"
+            );
+        }
+
         match &bars {
             // TTY: drive the live progress bars.
             Some(bars) => {
@@ -243,7 +274,7 @@ pub(crate) async fn run_ticker(
                         v.missing,
                     ));
                 }
-                if let (Some(text_bar), Some(v)) = (&bars.text, &text_vals) {
+                if let (false, Some(text_bar), Some(v)) = (text_done, &bars.text, &text_vals) {
                     text_bar.set_length(v.total_artifacts);
                     text_bar.set_position(v.scanned);
                     text_bar.set_message(format!(
@@ -276,7 +307,7 @@ pub(crate) async fn run_ticker(
                         v.missing,
                     ));
                 }
-                if let Some(v) = &text_vals {
+                if let (false, Some(v)) = (text_done, &text_vals) {
                     segments.push(format!(
                         "{} chunks | 1m: {recent_cps:.0} ch/s, {:.1} MB/s, ~{} tok/s | \
                          avg: {avg_cps:.0} ch/s | pipe: rd {} \u{2192} q {} \
@@ -304,7 +335,9 @@ pub(crate) async fn run_ticker(
                 if let Some(raw_bar) = &bars.raw {
                     raw_bar.finish();
                 }
-                if let Some(text_bar) = &bars.text {
+                // Skip if already retired at the embed→compaction transition, so
+                // the "compacting and building indexes" message is not overwritten.
+                if let (false, Some(text_bar)) = (text_done, &bars.text) {
                     text_bar.finish();
                 }
             }
